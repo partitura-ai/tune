@@ -26,13 +26,13 @@ type Stats struct {
 	History          []Entry `json:"history"`
 }
 
-func tuneDir() string {
+func TuneDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".tune")
 }
 
 func statsPath() string {
-	return filepath.Join(tuneDir(), "stats.json")
+	return filepath.Join(TuneDir(), "stats.json")
 }
 
 func Load() (*Stats, error) {
@@ -51,7 +51,7 @@ func Load() (*Stats, error) {
 }
 
 func (s *Stats) Save() error {
-	if err := os.MkdirAll(tuneDir(), 0755); err != nil {
+	if err := os.MkdirAll(TuneDir(), 0755); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(s, "", "  ")
