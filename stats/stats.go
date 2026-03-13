@@ -6,6 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/lipgloss/table"
+	"github.com/partitura-ai/tune/ui"
 )
 
 type Entry struct {
@@ -93,35 +97,63 @@ func (s *Stats) Record(command, intent string, rawChars, filteredChars int, filt
 }
 
 func (s *Stats) Print() {
-	fmt.Printf("Tune — Token Savings\n")
-	fmt.Printf("════════════════════════════════════\n")
-	fmt.Printf("  Commands filtered:  %d\n", s.TotalCommands)
-	fmt.Printf("  Raw tokens:         %d\n", s.TotalRawTokens)
-	fmt.Printf("  Filtered tokens:    %d\n", s.TotalFilteredTokens)
-	fmt.Printf("  Tokens saved:       %d\n", s.TotalRawTokens-s.TotalFilteredTokens)
-	fmt.Printf("  Savings:            %.1f%%\n", s.TotalSavings)
-	fmt.Printf("════════════════════════════════════\n")
+	saved := s.TotalRawTokens - s.TotalFilteredTokens
+
+	content := fmt.Sprintf(
+		"%s  %s\n%s  %s\n%s  %s\n%s  %s\n%s  %s",
+		ui.Label.Render("Commands filtered:"), ui.Value.Render(fmt.Sprintf("%d", s.TotalCommands)),
+		ui.Label.Render("Raw tokens:        "), ui.Value.Render(fmt.Sprintf("%d", s.TotalRawTokens)),
+		ui.Label.Render("Filtered tokens:   "), ui.Value.Render(fmt.Sprintf("%d", s.TotalFilteredTokens)),
+		ui.Label.Render("Tokens saved:      "), ui.Success.Render(fmt.Sprintf("%d", saved)),
+		ui.Label.Render("Savings:           "), ui.Success.Bold(true).Render(fmt.Sprintf("%.1f%%", s.TotalSavings)),
+	)
+
+	fmt.Println(ui.Title.Render("🎼 Tune — Token Savings"))
+	fmt.Println(ui.Box.Render(content))
 }
 
 func (s *Stats) PrintHistory() {
 	s.Print()
 	if len(s.History) == 0 {
-		fmt.Println("\n  No history yet.")
+		fmt.Println(ui.Faint.Render("\n  No history yet."))
 		return
 	}
-	fmt.Printf("\nRecent commands:\n")
+
+	fmt.Println()
+	fmt.Println(ui.Subtitle.Render("Recent commands"))
+
 	start := 0
 	if len(s.History) > 20 {
 		start = len(s.History) - 20
 	}
+
+	rows := make([][]string, 0, len(s.History[start:]))
 	for _, e := range s.History[start:] {
-		fmt.Printf("  %s  %5d → %3d tokens (%5.1f%%)  %4dms  %s\n",
+		rows = append(rows, []string{
 			e.Timestamp.Format("15:04:05"),
-			e.RawTokens, e.FilteredTokens, e.Savings,
-			e.FilterTime.Milliseconds(),
+			fmt.Sprintf("%d", e.RawTokens),
+			fmt.Sprintf("%d", e.FilteredTokens),
+			fmt.Sprintf("%.1f%%", e.Savings),
+			fmt.Sprintf("%dms", e.FilterTime.Milliseconds()),
 			truncateCmd(e.Command, 40),
-		)
+		})
 	}
+
+	t := table.New().
+		Headers("Time", "Raw", "Filtered", "Saved", "Latency", "Command").
+		Rows(rows...).
+		BorderStyle(lipgloss.NewStyle().Foreground(ui.Purple)).
+		StyleFunc(func(row, col int) lipgloss.Style {
+			if row == table.HeaderRow {
+				return lipgloss.NewStyle().Bold(true).Foreground(ui.Cyan)
+			}
+			if col == 3 {
+				return lipgloss.NewStyle().Foreground(ui.Green)
+			}
+			return lipgloss.NewStyle().Foreground(ui.White)
+		})
+
+	fmt.Println(t)
 }
 
 func truncateCmd(s string, max int) string {

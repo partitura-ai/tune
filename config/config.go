@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/partitura-ai/tune/ui"
 )
 
 type Config struct {
@@ -106,22 +108,27 @@ func (c *Config) ActiveAPIKey() string {
 
 // Print displays the current configuration.
 func (c *Config) Print() {
-	fmt.Printf("Tune Configuration\n")
-	fmt.Printf("════════════════════════════════════\n")
-	fmt.Printf("  Provider:  %s\n", c.Provider)
-	fmt.Printf("  Model:     %s\n", c.Model)
-	fmt.Printf("  Stream:    %v\n", c.Stream)
-	fmt.Printf("  Max input: %d chars\n", c.MaxInput)
-	fmt.Printf("\n  Auth:\n")
+	authStatus := ""
 	if c.Provider == "ollama" {
-		fmt.Printf("    ollama: local (no key needed)\n")
+		authStatus = ui.Success.Render("local (no key needed)")
 	} else if key := c.APIKeys[c.Provider]; key != "" {
-		fmt.Printf("    %s: %s\n", c.Provider, maskKey(key))
+		authStatus = ui.Success.Render(maskKey(key))
 	} else {
-		fmt.Printf("    %s: (no key — run 'tune config apikey <key>')\n", c.Provider)
+		authStatus = ui.Warning.Render("(no key — run 'tune config apikey <key>')")
 	}
-	fmt.Printf("════════════════════════════════════\n")
-	fmt.Printf("  Config file: %s\n", configPath())
+
+	content := fmt.Sprintf(
+		"%s  %s\n%s  %s\n%s  %s\n%s  %s\n\n%s  %s",
+		ui.Label.Render("Provider: "), ui.Value.Render(c.Provider),
+		ui.Label.Render("Model:    "), ui.Value.Render(c.Model),
+		ui.Label.Render("Stream:   "), ui.Value.Render(fmt.Sprintf("%v", c.Stream)),
+		ui.Label.Render("Max input:"), ui.Value.Render(fmt.Sprintf("%d chars", c.MaxInput)),
+		ui.Label.Render("Auth:     "), authStatus,
+	)
+
+	fmt.Println(ui.Title.Render("🎼 Tune Configuration"))
+	fmt.Println(ui.Box.Render(content))
+	fmt.Println(ui.Faint.Render("  " + configPath()))
 }
 
 func maskKey(key string) string {

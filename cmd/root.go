@@ -10,14 +10,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/partitura-ai/tune/config"
 	"github.com/partitura-ai/tune/filter"
 	"github.com/partitura-ai/tune/progress"
 	"github.com/partitura-ai/tune/registry"
 	"github.com/partitura-ai/tune/stats"
+	"github.com/partitura-ai/tune/ui"
 )
 
-const version = "1.1.0"
+const version = "1.2.0"
 
 func Execute() error {
 	args := os.Args[1:]
@@ -90,7 +92,7 @@ func cmdAdd(args []string) error {
 	}
 	for _, cmd := range args {
 		reg.Add(cmd)
-		fmt.Printf("  registered: %s\n", cmd)
+		fmt.Printf("  %s %s\n", ui.Success.Render("✓"), cmd)
 	}
 	if err := reg.Save(); err != nil {
 		return err
@@ -111,7 +113,7 @@ func cmdRemove(args []string) error {
 	}
 	for _, cmd := range args {
 		reg.Remove(cmd)
-		fmt.Printf("  unregistered: %s\n", cmd)
+		fmt.Printf("  %s %s\n", ui.Warning.Render("✗"), cmd)
 	}
 	if err := reg.Save(); err != nil {
 		return err
@@ -127,12 +129,12 @@ func cmdList() error {
 	}
 	cmds := reg.List()
 	if len(cmds) == 0 {
-		fmt.Println("No commands registered. Use 'tune add <command>' to register one.")
+		fmt.Println(ui.Faint.Render("No commands registered. Use 'tune add <command>' to register one."))
 		return nil
 	}
-	fmt.Println("Registered commands:")
+	fmt.Println(ui.Subtitle.Render("Registered commands"))
 	for _, cmd := range cmds {
-		fmt.Printf("  %s\n", cmd)
+		fmt.Printf("  %s %s\n", ui.Success.Render("•"), cmd)
 	}
 	return nil
 }
@@ -246,8 +248,8 @@ func cmdConfig(args []string) error {
 	switch args[0] {
 	case "provider":
 		if len(args) < 2 {
-			fmt.Printf("Current provider: %s\n", cfg.Provider)
-			fmt.Printf("Available: %s\n", strings.Join(config.Providers(), ", "))
+			fmt.Println(ui.Subtitle.Render("Current provider: ") + ui.Value.Render(cfg.Provider))
+			fmt.Println(ui.Faint.Render("Available: " + strings.Join(config.Providers(), ", ")))
 			return nil
 		}
 		p := args[1]
@@ -255,21 +257,35 @@ func cmdConfig(args []string) error {
 			return fmt.Errorf("unknown provider %q — available: %s", p, strings.Join(config.Providers(), ", "))
 		}
 		cfg.Provider = p
+		// Set sensible default model per provider
+		switch p {
+		case "openrouter":
+			cfg.Model = "openai/gpt-oss-20b"
+			cfg.OpenRouterProvider = "groq"
+		case "anthropic":
+			cfg.Model = "claude-haiku-4-5-20251001"
+		case "gemini":
+			cfg.Model = "gemini-2.5-flash-lite"
+		case "openai":
+			cfg.Model = "gpt-5-nano"
+		case "ollama":
+			cfg.Model = selectOllamaModel(cfg.Model)
+		}
 		if err := cfg.Save(); err != nil {
 			return err
 		}
-		fmt.Printf("Provider set to: %s\n", p)
+		fmt.Printf("%s Provider set to: %s (model: %s)\n", ui.Success.Render("✓"), p, cfg.Model)
 
 	case "model":
 		if len(args) < 2 {
-			fmt.Printf("Current model: %s\n", cfg.Model)
+			fmt.Println(ui.Subtitle.Render("Current model: ") + ui.Value.Render(cfg.Model))
 			return nil
 		}
 		cfg.Model = args[1]
 		if err := cfg.Save(); err != nil {
 			return err
 		}
-		fmt.Printf("Model set to: %s\n", args[1])
+		fmt.Printf("%s Model set to: %s\n", ui.Success.Render("✓"), args[1])
 
 	case "apikey":
 		if len(args) < 2 {
@@ -291,7 +307,7 @@ func cmdConfig(args []string) error {
 		if err := cfg.Save(); err != nil {
 			return err
 		}
-		fmt.Printf("API key set for: %s\n", provider)
+		fmt.Printf("%s API key set for: %s\n", ui.Success.Render("✓"), provider)
 
 	case "or-provider":
 		if len(args) < 2 {
@@ -302,7 +318,7 @@ func cmdConfig(args []string) error {
 		if err := cfg.Save(); err != nil {
 			return err
 		}
-		fmt.Printf("OpenRouter provider set to: %s\n", args[1])
+		fmt.Printf("%s OpenRouter provider set to: %s\n", ui.Success.Render("✓"), args[1])
 
 	case "max-input":
 		if len(args) < 2 {
@@ -317,7 +333,7 @@ func cmdConfig(args []string) error {
 		if err := cfg.Save(); err != nil {
 			return err
 		}
-		fmt.Printf("Max input set to: %d chars\n", n)
+		fmt.Printf("%s Max input set to: %d chars\n", ui.Success.Render("✓"), n)
 
 	case "stream":
 		if len(args) < 2 {
@@ -335,7 +351,7 @@ func cmdConfig(args []string) error {
 		if err := cfg.Save(); err != nil {
 			return err
 		}
-		fmt.Printf("Stream mode: %v\n", cfg.Stream)
+		fmt.Printf("%s Stream mode: %v\n", ui.Success.Render("✓"), cfg.Stream)
 
 	default:
 		return fmt.Errorf("unknown config key %q — use: provider, model, apikey, or-provider, max-input, stream", args[0])
@@ -688,6 +704,66 @@ func runCommand(args []string, passthrough bool) (string, int, error) {
 // Intent inference
 // ---------------------------------------------------------------------------
 
+// selectOllamaModel runs `ollama ls` and lets the user pick a model, or returns fallback.
+func selectOllamaModel(fallback string) string {
+	out, err := exec.Command("ollama", "ls").CombinedOutput()
+	if err != nil {
+		fmt.Println(ui.Warning.Render("Could not list Ollama models (is Ollama running?)"))
+		if fallback != "" {
+			return fallback
+		}
+		return "qwen3.5:9b"
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) <= 1 {
+		fmt.Println(ui.Warning.Render("No Ollama models found. Pull one with: ollama pull qwen3.5:9b"))
+		return "qwen3.5:9b"
+	}
+
+	// Parse model names from `ollama ls` output (first column)
+	var models []string
+	for _, line := range lines[1:] { // skip header
+		fields := strings.Fields(line)
+		if len(fields) > 0 {
+			models = append(models, fields[0])
+		}
+	}
+
+	if len(models) == 0 {
+		return "qwen3.5:9b"
+	}
+
+	fmt.Println(ui.Subtitle.Render("Available Ollama models"))
+	for i, m := range models {
+		fmt.Printf("  %s %s\n", ui.Accent.Render(fmt.Sprintf("[%d]", i+1)), m)
+	}
+	fmt.Print(ui.Faint.Render("Select model (number or name) [1]: "))
+
+	var input string
+	fmt.Scanln(&input)
+	input = strings.TrimSpace(input)
+
+	if input == "" {
+		return models[0]
+	}
+
+	// Try as number
+	var idx int
+	if _, err := fmt.Sscanf(input, "%d", &idx); err == nil && idx >= 1 && idx <= len(models) {
+		return models[idx-1]
+	}
+
+	// Try as model name (exact or prefix match)
+	for _, m := range models {
+		if strings.HasPrefix(m, input) {
+			return m
+		}
+	}
+
+	return input
+}
+
 func inferIntent(args []string) string {
 	cmd := strings.Join(args, " ")
 	switch {
@@ -715,56 +791,68 @@ func inferIntent(args []string) string {
 // ---------------------------------------------------------------------------
 
 func printUsage() {
-	fmt.Printf(`tune %s — AI-powered command output filter
-Don't let the noise waste your tokens... let's tune outputs to be just what your AI agents need.
+	title := ui.Title.Render(fmt.Sprintf("🎼 tune %s", version))
+	subtitle := lipgloss.NewStyle().Bold(true).Foreground(ui.White).Render("AI-powered command output filter")
+	slogan := ui.Slogan.Render("Don't let the noise waste your tokens... let's tune outputs to be just what your AI agents need.")
 
-Made by Gabriel Ferreira Angelo, creator of https://partitura-ai.com,
-to optimise token consumption on multi-agent teams.
-If you are a Software Engineer, make sure to check it out as well!
-You can also use Partitura 100%% for free!
+	fmt.Println(title + "  " + subtitle)
+	fmt.Println(slogan)
+	fmt.Println()
 
-Usage:
-  tune <command>                    Run command, print filtered output
-  tune -i "intent" <command>        Run with explicit intent
-  tune -p <command>                 Passthrough: show live + filtered summary
-  tune -s <command>                 Stream: filter output in real-time chunks
-  tune image <image-path>           Filter/extract info from image
-  tune image -i "intent" <path>     Image with explicit intent
-  tune gain                         Show token savings stats
-  tune gain --history               Show command history with savings
+	section := func(name string) string {
+		return ui.Subtitle.Render(name)
+	}
+	cmd := func(c, desc string) string {
+		return fmt.Sprintf("  %s  %s", lipgloss.NewStyle().Foreground(ui.White).Render(c), ui.Faint.Render(desc))
+	}
+	envLine := func(name, desc string) string {
+		return fmt.Sprintf("  %s  %s", ui.Value.Render(name), ui.Faint.Render(desc))
+	}
 
-Configuration:
-  tune config                       Show current config
-  tune config provider <name>       Set provider (openrouter, openai, anthropic, gemini, ollama)
-  tune config model <model>         Set model
-  tune config apikey <key>          Set API key for current provider
-  tune config apikey <prov> <key>   Set API key for specific provider
-  tune config or-provider <name>    Set OpenRouter sub-provider (e.g. groq)
-  tune config max-input <chars>     Set max input chars
+	fmt.Println(section("Usage"))
+	fmt.Println(cmd("tune <command>                  ", "Run command, print filtered output"))
+	fmt.Println(cmd("tune -i \"intent\" <command>      ", "Run with explicit intent"))
+	fmt.Println(cmd("tune -p <command>               ", "Passthrough: show live + filtered summary"))
+	fmt.Println(cmd("tune -s <command>               ", "Stream: filter in real-time chunks"))
+	fmt.Println(cmd("tune image <image-path>         ", "Filter/extract info from image"))
+	fmt.Println(cmd("tune gain                       ", "Show token savings stats"))
+	fmt.Println(cmd("tune gain --history             ", "Show command history"))
+	fmt.Println()
 
-Command registration:
-  tune add <command>                Register a command for interception
-  tune remove <command>             Unregister a command
-  tune list                         Show registered commands
-  tune init                         Output shell functions (eval this)
+	fmt.Println(section("Configuration"))
+	fmt.Println(cmd("tune config                     ", "Show current config"))
+	fmt.Println(cmd("tune config provider <name>     ", "Set provider (openrouter, openai, anthropic, gemini, ollama)"))
+	fmt.Println(cmd("tune config model <model>       ", "Set model"))
+	fmt.Println(cmd("tune config apikey <key>        ", "Set API key for current provider"))
+	fmt.Println(cmd("tune config apikey <prov> <key> ", "Set API key for specific provider"))
+	fmt.Println(cmd("tune config or-provider <name>  ", "Set OpenRouter sub-provider (e.g. groq)"))
+	fmt.Println(cmd("tune config max-input <chars>   ", "Set max input chars"))
+	fmt.Println()
 
-Setup:
-  tune add go git npm               Register commands
-  eval "$(tune init)"               Activate in current shell
+	fmt.Println(section("Command Registration"))
+	fmt.Println(cmd("tune add <command>              ", "Register a command for interception"))
+	fmt.Println(cmd("tune remove <command>           ", "Unregister a command"))
+	fmt.Println(cmd("tune list                       ", "Show registered commands"))
+	fmt.Println(cmd("tune init                       ", "Output shell functions (eval this)"))
+	fmt.Println()
 
-Environment (fallbacks if no config file):
-  TUNE_API_KEY                      API key for active provider
-  OPENROUTER_API_KEY                OpenRouter API key
-  OPENAI_API_KEY                    OpenAI API key
-  ANTHROPIC_API_KEY                 Anthropic API key
-  GEMINI_API_KEY                    Gemini API key
+	fmt.Println(section("Quick Start"))
+	fmt.Println(cmd("tune add go git npm             ", "Register commands"))
+	fmt.Println(cmd("eval \"$(tune init)\"             ", "Activate in current shell"))
+	fmt.Println()
 
-Examples:
-  tune go test -v ./...
-  tune -i "find compilation errors" make build
-  tune image screenshot.png
-  tune config provider openai
-  tune config model gpt-4o-mini
-  tune config apikey sk-...
-`, version)
+	fmt.Println(section("Environment"))
+	fmt.Println(envLine("TUNE_API_KEY        ", "API key for active provider"))
+	fmt.Println(envLine("OPENROUTER_API_KEY  ", "OpenRouter API key"))
+	fmt.Println(envLine("OPENAI_API_KEY      ", "OpenAI API key"))
+	fmt.Println(envLine("ANTHROPIC_API_KEY   ", "Anthropic API key"))
+	fmt.Println(envLine("GEMINI_API_KEY      ", "Gemini API key"))
+	fmt.Println()
+
+	credit := ui.Faint.Render("Made by Gabriel Ferreira Angelo, creator of ") +
+		lipgloss.NewStyle().Foreground(ui.Cyan).Underline(true).Render("https://partitura-ai.com")
+	fmt.Println(credit)
+	fmt.Println(ui.Faint.Render("To optimise token consumption on multi-agent teams."))
+	fmt.Println(ui.Faint.Render("If you are a Software Engineer, make sure to check it out as well!"))
+	fmt.Println(ui.Faint.Render("You can also use Partitura 100% for free!"))
 }
