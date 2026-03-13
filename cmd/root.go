@@ -17,7 +17,7 @@ import (
 	"github.com/partitura-ai/tune/stats"
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
 
 func Execute() error {
 	args := os.Args[1:]
@@ -95,7 +95,9 @@ func cmdAdd(args []string) error {
 	if err := reg.Save(); err != nil {
 		return err
 	}
-	fmt.Printf("\nRun 'eval \"$(tune init)\"' or add it to your shell profile to activate.\n")
+
+	// Auto-install eval line into shell profile if not already there
+	ensureShellInit()
 	return nil
 }
 
@@ -136,6 +138,56 @@ func cmdList() error {
 }
 
 // ---------------------------------------------------------------------------
+// ensureShellInit — add eval line to shell profile if missing
+// ---------------------------------------------------------------------------
+
+func ensureShellInit() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Detect shell profile
+	shell := os.Getenv("SHELL")
+	var profilePath string
+	switch {
+	case strings.Contains(shell, "zsh"):
+		profilePath = filepath.Join(home, ".zshrc")
+	case strings.Contains(shell, "bash"):
+		// Prefer .bashrc, fall back to .bash_profile
+		profilePath = filepath.Join(home, ".bashrc")
+		if _, err := os.Stat(profilePath); os.IsNotExist(err) {
+			profilePath = filepath.Join(home, ".bash_profile")
+		}
+	default:
+		profilePath = filepath.Join(home, ".zshrc")
+	}
+
+	initLine := `eval "$(tune init)"`
+
+	// Check if already present
+	data, err := os.ReadFile(profilePath)
+	if err == nil && strings.Contains(string(data), "tune init") {
+		fmt.Printf("\n  Shell init already in %s\n", profilePath)
+		fmt.Printf("  Restart your shell or run: eval \"$(tune init)\"\n")
+		return
+	}
+
+	// Append
+	f, err := os.OpenFile(profilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n  Could not write to %s: %v\n", profilePath, err)
+		fmt.Printf("  Add manually: %s\n", initLine)
+		return
+	}
+	defer f.Close()
+
+	fmt.Fprintf(f, "\n# Tune — AI command output filter\n%s\n", initLine)
+	fmt.Printf("\n  Added to %s\n", profilePath)
+	fmt.Printf("  Restart your shell or run: eval \"$(tune init)\"\n")
+}
+
+// ---------------------------------------------------------------------------
 // tune init — outputs shell functions for eval
 // ---------------------------------------------------------------------------
 
@@ -166,10 +218,11 @@ func cmdInit(args []string) error {
 
 	for _, cmd := range cmds {
 		fmt.Printf(`# tune wrapper for: %s
+unalias %s 2>/dev/null
 %s() {
   %s command %s "$@"
 }
-`, cmd, cmd, tuneBin, cmd)
+`, cmd, cmd, cmd, tuneBin, cmd)
 	}
 
 	return nil
@@ -462,13 +515,13 @@ func cmdFilter(args []string) error {
 	}
 
 	if filterErr != nil {
-		fmt.Fprintf(os.Stderr, "[tune] filter error: %v\n", filterErr)
+		fmt.Fprintf(os.Stderr, "<🎼> filter error: %v\n", filterErr)
 		fmt.Print(rawOutput)
 		os.Exit(exitCode)
 	}
 
 	if teeFile != "" {
-		fmt.Fprintf(os.Stderr, "[full output: %s]\n", teeFile)
+		fmt.Fprintf(os.Stderr, "<🎼> %s\n", teeFile)
 	}
 
 	s, _ := stats.Load()
@@ -535,17 +588,14 @@ func cmdFilterStreaming(cfg *config.Config, cmdArgs []string, cmdStr, cwd, inten
 	}
 
 	if filterErr != nil {
-		fmt.Fprintf(os.Stderr, "[tune] chunked filter error: %v\n", filterErr)
+		fmt.Fprintf(os.Stderr, "<🎼> chunked filter error: %v\n", filterErr)
 	}
 
 	if teeFile != "" {
-		fmt.Fprintf(os.Stderr, "[full output: %s]\n", teeFile)
+		fmt.Fprintf(os.Stderr, "<🎼> %s\n", teeFile)
 	}
 
 	if result != nil {
-		fmt.Fprintf(os.Stderr, "[tune] %d chunks, %d→%d chars, %dms filter time\n",
-			result.ChunkCount, result.RawLen, result.FilterLen, result.FilterTime.Milliseconds())
-
 		s, _ := stats.Load()
 		s.Record(cmdStr, "streaming", result.RawLen, result.FilterLen, result.FilterTime)
 		s.Save() //nolint:errcheck
@@ -666,6 +716,12 @@ func inferIntent(args []string) string {
 
 func printUsage() {
 	fmt.Printf(`tune %s — AI-powered command output filter
+Don't let the noise waste your tokens... let's tune outputs to be just what your AI agents need.
+
+Made by Gabriel Ferreira Angelo, creator of https://partitura-ai.com,
+to optimise token consumption on multi-agent teams.
+If you are a Software Engineer, make sure to check it out as well!
+You can also use Partitura 100%% for free!
 
 Usage:
   tune <command>                    Run command, print filtered output

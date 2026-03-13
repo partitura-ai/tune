@@ -8,12 +8,12 @@ import (
 )
 
 type Config struct {
-	Provider         string            `json:"provider"`
-	Model            string            `json:"model"`
-	OpenRouterProvider string          `json:"openrouter_provider,omitempty"`
-	APIKeys          map[string]string `json:"api_keys"`
-	MaxInput         int               `json:"max_input"`
-	Stream           bool              `json:"stream"`
+	Provider           string            `json:"provider"`
+	Model              string            `json:"model"`
+	OpenRouterProvider string            `json:"openrouter_provider,omitempty"`
+	APIKeys            map[string]string `json:"api_keys"`
+	MaxInput           int               `json:"max_input"`
+	Stream             bool              `json:"stream"`
 }
 
 func DefaultConfig() Config {
@@ -74,7 +74,6 @@ func (c *Config) loadEnvKeys() {
 	}
 	// TUNE_API_KEY is a universal fallback for the active provider
 	tuneKey := os.Getenv("TUNE_API_KEY")
-
 	for provider, envVar := range envMap {
 		if c.APIKeys[provider] == "" {
 			if v := os.Getenv(envVar); v != "" {
@@ -111,18 +110,15 @@ func (c *Config) Print() {
 	fmt.Printf("════════════════════════════════════\n")
 	fmt.Printf("  Provider:  %s\n", c.Provider)
 	fmt.Printf("  Model:     %s\n", c.Model)
-	if c.OpenRouterProvider != "" && c.Provider == "openrouter" {
-		fmt.Printf("  OR Provider: %s\n", c.OpenRouterProvider)
-	}
 	fmt.Printf("  Stream:    %v\n", c.Stream)
 	fmt.Printf("  Max input: %d chars\n", c.MaxInput)
-	fmt.Printf("\n  API Keys:\n")
-	for provider, key := range c.APIKeys {
-		masked := maskKey(key)
-		fmt.Printf("    %s: %s\n", provider, masked)
-	}
-	if len(c.APIKeys) == 0 {
-		fmt.Printf("    (none configured)\n")
+	fmt.Printf("\n  Auth:\n")
+	if c.Provider == "ollama" {
+		fmt.Printf("    ollama: local (no key needed)\n")
+	} else if key := c.APIKeys[c.Provider]; key != "" {
+		fmt.Printf("    %s: %s\n", c.Provider, maskKey(key))
+	} else {
+		fmt.Printf("    %s: (no key — run 'tune config apikey <key>')\n", c.Provider)
 	}
 	fmt.Printf("════════════════════════════════════\n")
 	fmt.Printf("  Config file: %s\n", configPath())
@@ -137,7 +133,7 @@ func maskKey(key string) string {
 
 // Providers returns valid provider names.
 func Providers() []string {
-	return []string{"openrouter", "openai", "anthropic", "gemini", "ollama"}
+	return []string{"openrouter", "ollama", "openai", "anthropic", "gemini"}
 }
 
 // ValidProvider checks if a provider name is valid.
