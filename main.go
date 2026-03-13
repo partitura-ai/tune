@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Gabriel-Feang/tune/cmd"
+	"github.com/partitura-ai/tune/cmd"
 )
 
 func main() {

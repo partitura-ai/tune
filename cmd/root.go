@@ -10,12 +10,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Gabriel-Feang/tune/filter"
-	"github.com/Gabriel-Feang/tune/stats"
-	"github.com/Gabriel-Feang/tune/registry"
+	"github.com/partitura-ai/tune/config"
+	"github.com/partitura-ai/tune/filter"
+	"github.com/partitura-ai/tune/progress"
+	"github.com/partitura-ai/tune/registry"
+	"github.com/partitura-ai/tune/stats"
 )
 
-const version = "0.1.0"
+const version = "1.0.0"
 
 func Execute() error {
 	args := os.Args[1:]
@@ -36,6 +38,10 @@ func Execute() error {
 		return cmdList()
 	case "init":
 		return cmdInit(args[1:])
+	case "config":
+		return cmdConfig(args[1:])
+	case "image", "img":
+		return cmdImage(args[1:])
 	case "version", "--version", "-v":
 		fmt.Printf("tune %s\n", version)
 		return nil
@@ -158,9 +164,6 @@ func cmdInit(args []string) error {
 		return nil
 	}
 
-	// Emit a shell function for each registered command.
-	// The function calls `tune` with the original command, passing all args.
-	// `command <cmd>` bypasses the function to call the real binary.
 	for _, cmd := range cmds {
 		fmt.Printf(`# tune wrapper for: %s
 %s() {
@@ -173,12 +176,188 @@ func cmdInit(args []string) error {
 }
 
 // ---------------------------------------------------------------------------
+// tune config — configuration management
+// ---------------------------------------------------------------------------
+
+func cmdConfig(args []string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	if len(args) == 0 {
+		cfg.Print()
+		return nil
+	}
+
+	switch args[0] {
+	case "provider":
+		if len(args) < 2 {
+			fmt.Printf("Current provider: %s\n", cfg.Provider)
+			fmt.Printf("Available: %s\n", strings.Join(config.Providers(), ", "))
+			return nil
+		}
+		p := args[1]
+		if !config.ValidProvider(p) {
+			return fmt.Errorf("unknown provider %q — available: %s", p, strings.Join(config.Providers(), ", "))
+		}
+		cfg.Provider = p
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Printf("Provider set to: %s\n", p)
+
+	case "model":
+		if len(args) < 2 {
+			fmt.Printf("Current model: %s\n", cfg.Model)
+			return nil
+		}
+		cfg.Model = args[1]
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Printf("Model set to: %s\n", args[1])
+
+	case "apikey":
+		if len(args) < 2 {
+			fmt.Printf("Set API key for current provider (%s):\n", cfg.Provider)
+			fmt.Printf("  tune config apikey <key>\n")
+			fmt.Printf("  tune config apikey <provider> <key>\n")
+			return nil
+		}
+		provider := cfg.Provider
+		key := args[1]
+		if len(args) >= 3 {
+			provider = args[1]
+			key = args[2]
+			if !config.ValidProvider(provider) {
+				return fmt.Errorf("unknown provider %q", provider)
+			}
+		}
+		cfg.APIKeys[provider] = key
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Printf("API key set for: %s\n", provider)
+
+	case "or-provider":
+		if len(args) < 2 {
+			fmt.Printf("Current OpenRouter provider: %s\n", cfg.OpenRouterProvider)
+			return nil
+		}
+		cfg.OpenRouterProvider = args[1]
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Printf("OpenRouter provider set to: %s\n", args[1])
+
+	case "max-input":
+		if len(args) < 2 {
+			fmt.Printf("Current max input: %d chars\n", cfg.MaxInput)
+			return nil
+		}
+		var n int
+		if _, err := fmt.Sscanf(args[1], "%d", &n); err != nil || n < 100 {
+			return fmt.Errorf("invalid max-input: must be a number >= 100")
+		}
+		cfg.MaxInput = n
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Printf("Max input set to: %d chars\n", n)
+
+	case "stream":
+		if len(args) < 2 {
+			fmt.Printf("Stream mode: %v\n", cfg.Stream)
+			return nil
+		}
+		switch args[1] {
+		case "on", "true", "yes":
+			cfg.Stream = true
+		case "off", "false", "no":
+			cfg.Stream = false
+		default:
+			return fmt.Errorf("invalid value %q — use: on/off", args[1])
+		}
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Printf("Stream mode: %v\n", cfg.Stream)
+
+	default:
+		return fmt.Errorf("unknown config key %q — use: provider, model, apikey, or-provider, max-input, stream", args[0])
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// tune image — filter image with resolution backoff
+// ---------------------------------------------------------------------------
+
+func cmdImage(args []string) error {
+	intent := ""
+	var imagePath string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--intent", "-i":
+			if i+1 < len(args) {
+				i++
+				intent = args[i]
+			}
+		default:
+			imagePath = args[i]
+		}
+	}
+
+	if imagePath == "" {
+		return fmt.Errorf("usage: tune image [-i intent] <image-path>")
+	}
+
+	imageData, err := os.ReadFile(imagePath)
+	if err != nil {
+		return fmt.Errorf("failed to read image: %w", err)
+	}
+
+	mimeType := filter.DetectMIME(imageData)
+	if !strings.HasPrefix(mimeType, "image/") {
+		return fmt.Errorf("file does not appear to be an image: %s", mimeType)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	result, err := filter.FilterImage(ctx, cfg, imageData, mimeType, intent)
+	if err != nil {
+		return fmt.Errorf("image filter error: %w", err)
+	}
+
+	fmt.Print(result.Filtered)
+	if !strings.HasSuffix(result.Filtered, "\n") {
+		fmt.Println()
+	}
+
+	// Record stats
+	s, _ := stats.Load()
+	s.Record("image:"+filepath.Base(imagePath), intent, result.RawLen, result.FilterLen, result.FilterTime)
+	s.Save() //nolint:errcheck
+
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // tune <command> — filter
 // ---------------------------------------------------------------------------
 
 func cmdFilter(args []string) error {
 	intent := ""
 	passthrough := false
+	streamOverride := 0 // 0=use config, 1=force on, -1=force off
 	var cmdArgs []string
 
 	for i := 0; i < len(args); i++ {
@@ -190,6 +369,10 @@ func cmdFilter(args []string) error {
 			}
 		case "--passthrough", "-p":
 			passthrough = true
+		case "--stream", "-s":
+			streamOverride = 1
+		case "--no-stream":
+			streamOverride = -1
 		case "--":
 			cmdArgs = append(cmdArgs, args[i+1:]...)
 			i = len(args)
@@ -207,58 +390,166 @@ func cmdFilter(args []string) error {
 		intent = inferIntent(cmdArgs)
 	}
 
-	apiKey := os.Getenv("TUNE_API_KEY")
-	if apiKey == "" {
-		apiKey = os.Getenv("OPENROUTER_API_KEY")
-	}
-	if apiKey == "" {
-		return fmt.Errorf("no API key: set TUNE_API_KEY or OPENROUTER_API_KEY")
+	cfg, err := config.Load()
+	if err != nil {
+		return err
 	}
 
-	// Run command
+	if cfg.ActiveAPIKey() == "" && cfg.Provider != "ollama" {
+		return fmt.Errorf("no API key: set via 'tune config apikey <key>' or TUNE_API_KEY env var")
+	}
+
 	cmdStr := strings.Join(cmdArgs, " ")
-	rawOutput, exitCode, err := runCommand(cmdArgs, passthrough)
-	if err != nil && rawOutput == "" {
-		return fmt.Errorf("command failed to start: %w", err)
+	cwd, _ := os.Getwd()
+
+	// Resolve streaming: flag overrides config
+	streaming := cfg.Stream
+	if streamOverride == 1 {
+		streaming = true
+	} else if streamOverride == -1 {
+		streaming = false
 	}
 
-	// Always write full output to a tee file so the agent can check it
+	// Streaming mode: filter output in chunks as the command runs
+	if streaming && !passthrough {
+		return cmdFilterStreaming(cfg, cmdArgs, cmdStr, cwd, intent)
+	}
+
+	// Standard mode: run command, then filter
+	durations := progress.LoadDurations()
+	estimate := durations.Estimate(cmdStr, cwd)
+	bar := progress.Start(cmdStr, estimate)
+
+	cmdStart := time.Now()
+	rawOutput, exitCode, runErr := runCommand(cmdArgs, passthrough)
+	cmdElapsed := time.Since(cmdStart)
+	bar.Stop()
+
+	durations.Record(cmdStr, cwd, cmdElapsed)
+	durations.Save()
+
+	if runErr != nil && rawOutput == "" {
+		return fmt.Errorf("command failed to start: %w", runErr)
+	}
+
 	teeFile := writeTeeFile(cmdStr, rawOutput)
 
-	// Skip filtering for tiny output (not worth the API call)
 	rawTokens := len(rawOutput) / 4
 	if rawTokens < 20 {
 		fmt.Print(rawOutput)
 		os.Exit(exitCode)
 	}
 
-	// Filter
-	cfg := filter.DefaultConfig()
-	cfg.APIKey = apiKey
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	result, err := filter.Filter(ctx, cfg, rawOutput, exitCode, intent)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[tune] filter error: %v\n", err)
+	var result *filter.Result
+	var filterErr error
+
+	if exitCode != 0 {
+		result, filterErr = filter.FilterStream(ctx, cfg, os.Stdout, rawOutput, exitCode, intent)
+		if filterErr == nil && !strings.HasSuffix(result.Filtered, "\n") {
+			fmt.Println()
+		}
+	} else {
+		result, filterErr = filter.Filter(ctx, cfg, rawOutput, exitCode, intent)
+		if filterErr == nil {
+			fmt.Print(result.Filtered)
+			if !strings.HasSuffix(result.Filtered, "\n") {
+				fmt.Println()
+			}
+		}
+	}
+
+	if filterErr != nil {
+		fmt.Fprintf(os.Stderr, "[tune] filter error: %v\n", filterErr)
 		fmt.Print(rawOutput)
 		os.Exit(exitCode)
 	}
 
-	// Print filtered output with tee file reference
-	fmt.Print(result.Filtered)
-	if !strings.HasSuffix(result.Filtered, "\n") {
-		fmt.Println()
-	}
 	if teeFile != "" {
 		fmt.Fprintf(os.Stderr, "[full output: %s]\n", teeFile)
 	}
 
-	// Record stats
 	s, _ := stats.Load()
 	s.Record(cmdStr, intent, result.RawLen, result.FilterLen, result.FilterTime)
 	s.Save() //nolint:errcheck
+
+	os.Exit(exitCode)
+	return nil
+}
+
+// cmdFilterStreaming runs a command and filters its output in real-time chunks.
+func cmdFilterStreaming(cfg *config.Config, cmdArgs []string, cmdStr, cwd, intent string) error {
+	_ = intent // TODO: pass intent into chunk prompts
+
+	cmd := exec.Command("sh", "-c", strings.Join(cmdArgs, " "))
+
+	// Merge stdout and stderr into a single pipe
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	// Also tee raw output for the tee file
+	var rawBuf strings.Builder
+	teeReader := io.TeeReader(pr, &rawBuf)
+
+	exitCodeCh := make(chan int, 1)
+
+	cmdStart := time.Now()
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		return fmt.Errorf("command failed to start: %w", err)
+	}
+
+	// When the command exits, close the write end and send exit code
+	go func() {
+		cmd.Wait()
+		pw.Close()
+		exitCode := 0
+		if cmd.ProcessState != nil {
+			exitCode = cmd.ProcessState.ExitCode()
+		}
+		exitCodeCh <- exitCode
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	cc := filter.DefaultChunkedConfig()
+	result, filterErr := filter.FilterChunked(ctx, cfg, cc, teeReader, os.Stdout, exitCodeCh)
+
+	cmdElapsed := time.Since(cmdStart)
+
+	// Record duration
+	durations := progress.LoadDurations()
+	durations.Record(cmdStr, cwd, cmdElapsed)
+	durations.Save()
+
+	// Write tee file with full raw output
+	teeFile := writeTeeFile(cmdStr, rawBuf.String())
+
+	exitCode := 0
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
+
+	if filterErr != nil {
+		fmt.Fprintf(os.Stderr, "[tune] chunked filter error: %v\n", filterErr)
+	}
+
+	if teeFile != "" {
+		fmt.Fprintf(os.Stderr, "[full output: %s]\n", teeFile)
+	}
+
+	if result != nil {
+		fmt.Fprintf(os.Stderr, "[tune] %d chunks, %d→%d chars, %dms filter time\n",
+			result.ChunkCount, result.RawLen, result.FilterLen, result.FilterTime.Milliseconds())
+
+		s, _ := stats.Load()
+		s.Record(cmdStr, "streaming", result.RawLen, result.FilterLen, result.FilterTime)
+		s.Save() //nolint:errcheck
+	}
 
 	os.Exit(exitCode)
 	return nil
@@ -275,7 +566,6 @@ func writeTeeFile(cmdStr, rawOutput string) string {
 		return ""
 	}
 
-	// Use timestamp + sanitized command name
 	ts := time.Now().UnixMilli()
 	cmdName := sanitizeFilename(cmdStr)
 	if len(cmdName) > 40 {
@@ -288,9 +578,7 @@ func writeTeeFile(cmdStr, rawOutput string) string {
 		return ""
 	}
 
-	// Clean up old tee files (keep last 50)
 	cleanTeeDir(teeDir, 50)
-
 	return path
 }
 
@@ -313,7 +601,6 @@ func cleanTeeDir(dir string, keep int) {
 	if err != nil || len(entries) <= keep {
 		return
 	}
-	// Entries are sorted by name (timestamp prefix), so oldest first
 	toRemove := len(entries) - keep
 	for i := 0; i < toRemove; i++ {
 		os.Remove(filepath.Join(dir, entries[i].Name()))
@@ -384,8 +671,20 @@ Usage:
   tune <command>                    Run command, print filtered output
   tune -i "intent" <command>        Run with explicit intent
   tune -p <command>                 Passthrough: show live + filtered summary
+  tune -s <command>                 Stream: filter output in real-time chunks
+  tune image <image-path>           Filter/extract info from image
+  tune image -i "intent" <path>     Image with explicit intent
   tune gain                         Show token savings stats
   tune gain --history               Show command history with savings
+
+Configuration:
+  tune config                       Show current config
+  tune config provider <name>       Set provider (openrouter, openai, anthropic, gemini, ollama)
+  tune config model <model>         Set model
+  tune config apikey <key>          Set API key for current provider
+  tune config apikey <prov> <key>   Set API key for specific provider
+  tune config or-provider <name>    Set OpenRouter sub-provider (e.g. groq)
+  tune config max-input <chars>     Set max input chars
 
 Command registration:
   tune add <command>                Register a command for interception
@@ -396,16 +695,20 @@ Command registration:
 Setup:
   tune add go git npm               Register commands
   eval "$(tune init)"               Activate in current shell
-  # Or add to ~/.zshrc:
-  echo 'eval "$(tune init)"' >> ~/.zshrc
 
-Environment:
-  TUNE_API_KEY or OPENROUTER_API_KEY    Required for filtering
+Environment (fallbacks if no config file):
+  TUNE_API_KEY                      API key for active provider
+  OPENROUTER_API_KEY                OpenRouter API key
+  OPENAI_API_KEY                    OpenAI API key
+  ANTHROPIC_API_KEY                 Anthropic API key
+  GEMINI_API_KEY                    Gemini API key
 
 Examples:
   tune go test -v ./...
   tune -i "find compilation errors" make build
-  tune git diff --stat
-  tune gain
+  tune image screenshot.png
+  tune config provider openai
+  tune config model gpt-4o-mini
+  tune config apikey sk-...
 `, version)
 }
