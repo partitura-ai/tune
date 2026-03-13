@@ -855,4 +855,6 @@ func printUsage() {
 	fmt.Println(ui.Faint.Render("To optimise token consumption on multi-agent teams."))
 	fmt.Println(ui.Faint.Render("If you are a Software Engineer, make sure to check it out as well!"))
 	fmt.Println(ui.Faint.Render("You can also use Partitura 100% for free!"))
+	fmt.Println()
+	fmt.Println(ui.Slogan.Render("~Hope you enjoy this tiny piece of what Partitura can do."))
 }
