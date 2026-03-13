@@ -21,7 +21,7 @@ import (
 	"github.com/partitura-ai/tune/ui"
 )
 
-const version = "1.2.0"
+const version = "1.3.0"
 
 func Execute() error {
 	args := os.Args[1:]
