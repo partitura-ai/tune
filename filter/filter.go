@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"time"
 
 	"github.com/partitura-ai/tune/config"
@@ -22,15 +25,21 @@ CRITICAL rules:
 - Do NOT add your own commentary — output ONLY the filtered result
 - Do NOT wrap in markdown code blocks`
 
-const imageSystemPrompt = `You are a command output filter for AI coding agents. You are looking at a screenshot. Your job is to extract ONLY the essential information the agent needs.
+const imageSystemPrompt = `You are a vision preprocessor for AI coding agents. You receive images (screenshots, diagrams, UI mockups, terminal output, etc.) and produce a comprehensive text representation so the downstream agent never needs to see the raw pixels.
 
-CRITICAL rules:
-- Extract all text content visible in the image
-- Focus on: error messages, file paths, line numbers, stack traces, status indicators
-- If it's a passing/successful output, respond with ONLY "PASS" or "ok"
-- If there are errors/failures, include every error message, file path, and line number
-- Do NOT add your own commentary — output ONLY the extracted essential info
-- Do NOT wrap in markdown code blocks`
+Your output MUST include:
+1. **OCR**: All visible text, preserving layout, indentation, and hierarchy. Use monospace formatting for code/terminal content.
+2. **Visual context**: What the image shows (app window, terminal, browser, diagram, mockup, error dialog, etc.), colors, layout, and spatial relationships.
+3. **Actionable details**: Error messages, file paths, line numbers, URLs, button labels, form fields, status indicators — anything a coding agent would need to act on.
+
+Rules:
+- Be thorough — the agent CANNOT see the image, only your description
+- Preserve exact text (don't paraphrase error messages or code)
+- For terminal/code screenshots: reproduce the full text content
+- For UI screenshots: describe the layout and all interactive elements
+- For diagrams: describe the structure, relationships, and all labels
+- Do NOT wrap in markdown code blocks unless reproducing code content
+- Do NOT add meta-commentary like "this image shows" — just describe directly`
 
 type Result struct {
 	Filtered   string
@@ -78,6 +87,9 @@ func Filter(ctx context.Context, cfg *config.Config, rawOutput string, exitCode 
 	if cfg.Provider == "ollama" {
 		return filterOllama(ctx, cfg, userMsg)
 	}
+	if cfg.Provider == "fastvlm" {
+		return nil, fmt.Errorf("fastvlm provider only supports image filtering (use 'tune image')")
+	}
 	return filterOpenAICompat(ctx, cfg, apiKey, userMsg, nil)
 }
 
@@ -86,7 +98,7 @@ func Filter(ctx context.Context, cfg *config.Config, rawOutput string, exitCode 
 // image that produces a good response — escalating only if needed.
 func FilterImage(ctx context.Context, cfg *config.Config, imageData []byte, mimeType string, intent string) (*Result, error) {
 	apiKey := cfg.ActiveAPIKey()
-	if apiKey == "" && cfg.Provider != "ollama" {
+	if apiKey == "" && cfg.Provider != "ollama" && cfg.Provider != "fastvlm" {
 		return nil, fmt.Errorf("no API key for provider %q", cfg.Provider)
 	}
 
@@ -97,6 +109,25 @@ func FilterImage(ctx context.Context, cfg *config.Config, imageData []byte, mime
 	// OCR the full-res image first — free text extraction the model can use
 	// as reference if characters are hard to read at low resolution
 	ocrText := ocrImage(imageData)
+
+	// FastVLM: local binary, processes image file directly — no base64, no HTTP
+	if cfg.Provider == "fastvlm" {
+		return filterFastVLMImage(ctx, imageData, intent)
+	}
+
+	// For Ollama: skip resolution backoff (too slow for multiple attempts),
+	// send at a single reasonable resolution
+	if cfg.Provider == "ollama" {
+		resized, err := resizeImage(imageData, mimeType, 512)
+		if err != nil {
+			resized = imageData
+		}
+		fullIntent := intent
+		if ocrText != "" {
+			fullIntent = fmt.Sprintf("%s\n\nOCR text extracted from this image (use as reference for any hard-to-read characters):\n%s", intent, ocrText)
+		}
+		return filterOllamaImage(ctx, cfg, resized, fullIntent)
+	}
 
 	// Resolution backoff: start small, increase if response is too brief
 	resolutions := []int{256, 512, 1024, 2048}
@@ -123,8 +154,6 @@ func FilterImage(ctx context.Context, cfg *config.Config, imageData []byte, mime
 		switch cfg.Provider {
 		case "anthropic":
 			result, err = filterAnthropicImage(ctx, cfg, apiKey, resized, mimeType, fullIntent)
-		case "ollama":
-			result, err = filterOllamaImage(ctx, cfg, resized, fullIntent)
 		default:
 			result, err = filterOpenAICompatImage(ctx, cfg, apiKey, resized, mimeType, fullIntent)
 		}
@@ -379,7 +408,7 @@ func filterOllamaImage(ctx context.Context, cfg *config.Config, imageData []byte
 			{"role": "system", "content": imageSystemPrompt},
 			{
 				"role":    "user",
-				"content": fmt.Sprintf("Intent: %s", intent),
+				"content": fmt.Sprintf("/no_think\nIntent: %s", intent),
 				"images":  []string{b64},
 			},
 		},
@@ -428,6 +457,66 @@ func doOllamaRequest(ctx context.Context, body map[string]any) (*Result, error) 
 	}
 
 	filtered := result.Message.Content
+	return &Result{
+		Filtered:   filtered,
+		FilterLen:  len(filtered),
+		FilterTime: filterTime,
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// FastVLM (local binary — Apple Silicon Neural Engine)
+// ---------------------------------------------------------------------------
+
+func fastvlmBinary() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "bin", "fastvlm-cli")
+}
+
+func filterFastVLMImage(ctx context.Context, imageData []byte, intent string) (*Result, error) {
+	bin := fastvlmBinary()
+	if _, err := os.Stat(bin); err != nil {
+		return nil, fmt.Errorf("fastvlm-cli not found at %s (build with: cd ~/fastvlm-cli && swift build -c release)", bin)
+	}
+
+	// Write image to temp file (fastvlm-cli takes a file path, not stdin)
+	tmpFile, err := os.CreateTemp("", "tune-fastvlm-*.png")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.Write(imageData); err != nil {
+		tmpFile.Close()
+		return nil, fmt.Errorf("failed to write temp file: %w", err)
+	}
+	tmpFile.Close()
+
+	home, _ := os.UserHomeDir()
+	modelPath := filepath.Join(home, "ml-fastvlm/app/FastVLM/model")
+
+	prompt := "Describe this image comprehensively for a coding AI agent that cannot see it. Include: 1) Full OCR of all visible text, preserving layout and indentation 2) Visual context: what the image shows (terminal, browser, UI, diagram, etc), layout, colors 3) Actionable details: error messages, file paths, line numbers, URLs, button labels, status indicators. Be thorough and preserve exact text."
+	if intent != "" {
+		prompt = intent
+	}
+
+	args := []string{
+		tmpFile.Name(),
+		"--prompt", prompt,
+		"--model-path", modelPath,
+		"--max-tokens", "240",
+	}
+
+	cmd := exec.CommandContext(ctx, bin, args...)
+	start := time.Now()
+	output, err := cmd.Output()
+	filterTime := time.Since(start)
+
+	if err != nil {
+		return nil, fmt.Errorf("fastvlm-cli failed: %w", err)
+	}
+
+	filtered := string(output)
 	return &Result{
 		Filtered:   filtered,
 		FilterLen:  len(filtered),

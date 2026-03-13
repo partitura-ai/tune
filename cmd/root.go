@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/partitura-ai/tune/config"
+	"github.com/partitura-ai/tune/fastvlm"
 	"github.com/partitura-ai/tune/filter"
 	"github.com/partitura-ai/tune/progress"
 	"github.com/partitura-ai/tune/registry"
@@ -42,8 +44,16 @@ func Execute() error {
 		return cmdInit(args[1:])
 	case "config":
 		return cmdConfig(args[1:])
+	case "reset":
+		return cmdReset()
 	case "image", "img":
 		return cmdImage(args[1:])
+	case "enable":
+		return cmdEnable()
+	case "disable":
+		return cmdDisable()
+	case "fastvlm":
+		return cmdFastVLM(args[1:])
 	case "version", "--version", "-v":
 		fmt.Printf("tune %s\n", version)
 		return nil
@@ -234,6 +244,135 @@ unalias %s 2>/dev/null
 // tune config — configuration management
 // ---------------------------------------------------------------------------
 
+func cmdConfigInteractive(cfg *config.Config) error {
+	fmt.Println(ui.Title.Render("🎼 Tune Setup"))
+	fmt.Println()
+
+	// --- 1. Provider ---
+	providers := config.Providers()
+	defaultIdx := 0
+	for i, p := range providers {
+		if p == cfg.Provider {
+			defaultIdx = i
+			break
+		}
+	}
+	fmt.Println(ui.Subtitle.Render("Provider"))
+	for i, p := range providers {
+		marker := "  "
+		if i == defaultIdx {
+			marker = ui.Success.Render("→ ")
+		}
+		fmt.Printf("%s%s %s\n", marker, ui.Accent.Render(fmt.Sprintf("[%d]", i+1)), p)
+	}
+	fmt.Printf(ui.Faint.Render("Select [%d]: "), defaultIdx+1)
+
+	var input string
+	fmt.Scanln(&input)
+	input = strings.TrimSpace(input)
+	if input != "" {
+		var idx int
+		if _, err := fmt.Sscanf(input, "%d", &idx); err == nil && idx >= 1 && idx <= len(providers) {
+			cfg.Provider = providers[idx-1]
+		} else {
+			// Try as name
+			for _, p := range providers {
+				if strings.EqualFold(p, input) {
+					cfg.Provider = p
+					break
+				}
+			}
+		}
+	}
+	fmt.Printf("  %s %s\n\n", ui.Success.Render("✓"), cfg.Provider)
+
+	// --- 2. API Key (if needed and not already set) ---
+	if cfg.Provider != "ollama" && cfg.Provider != "fastvlm" {
+		existingKey := cfg.ActiveAPIKey()
+		if existingKey == "" {
+			envVar := config.EnvVarForProvider(cfg.Provider)
+			fmt.Println(ui.Subtitle.Render("API Key"))
+			if envVar != "" {
+				fmt.Printf(ui.Faint.Render("  No key found (checked %s env var)\n"), envVar)
+			}
+			fmt.Print(ui.Faint.Render("Paste API key: "))
+			fmt.Scanln(&input)
+			input = strings.TrimSpace(input)
+			if input != "" {
+				cfg.APIKeys[cfg.Provider] = input
+				fmt.Printf("  %s Key set\n\n", ui.Success.Render("✓"))
+			} else {
+				fmt.Printf("  %s Skipped (set later with 'tune config apikey <key>')\n\n", ui.Warning.Render("!"))
+			}
+		} else {
+			fmt.Printf("%s  %s\n\n", ui.Faint.Render("API Key:"), ui.Success.Render(config.MaskKey(existingKey)))
+		}
+	}
+
+	// --- 3. Model ---
+	defaultModel := cfg.Model
+	if defaultModel == "" {
+		defaultModel = config.DefaultModelForProvider(cfg.Provider)
+	}
+	fmt.Println(ui.Subtitle.Render("Model"))
+	if cfg.Provider == "ollama" {
+		cfg.Model = selectOllamaModel(defaultModel)
+	} else {
+		fmt.Printf(ui.Faint.Render("Model [%s]: "), defaultModel)
+		fmt.Scanln(&input)
+		input = strings.TrimSpace(input)
+		if input != "" {
+			cfg.Model = input
+		} else {
+			cfg.Model = defaultModel
+		}
+	}
+	fmt.Printf("  %s %s\n\n", ui.Success.Render("✓"), cfg.Model)
+
+	// --- 4. Timeout ---
+	fmt.Println(ui.Subtitle.Render("Timeout"))
+	fmt.Printf(ui.Faint.Render("Filter timeout in seconds [%d]: "), cfg.Timeout)
+	fmt.Scanln(&input)
+	input = strings.TrimSpace(input)
+	if input != "" {
+		var n int
+		if _, err := fmt.Sscanf(input, "%d", &n); err == nil && n >= 1 {
+			cfg.Timeout = n
+		}
+	}
+	fmt.Printf("  %s %ds\n\n", ui.Success.Render("✓"), cfg.Timeout)
+
+	// --- 5. Stream ---
+	fmt.Println(ui.Subtitle.Render("Streaming"))
+	streamDefault := "on"
+	if !cfg.Stream {
+		streamDefault = "off"
+	}
+	fmt.Printf(ui.Faint.Render("Stream mode on/off [%s]: "), streamDefault)
+	fmt.Scanln(&input)
+	input = strings.TrimSpace(strings.ToLower(input))
+	switch input {
+	case "off", "false", "no":
+		cfg.Stream = false
+	case "on", "true", "yes":
+		cfg.Stream = true
+	}
+	streamLabel := "on"
+	if !cfg.Stream {
+		streamLabel = "off"
+	}
+	fmt.Printf("  %s %s\n\n", ui.Success.Render("✓"), streamLabel)
+
+	// --- Save ---
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+
+	fmt.Println(ui.Success.Render("✓ Configuration saved"))
+	fmt.Println(ui.Faint.Render("  " + filepath.Join(os.Getenv("HOME"), ".tune", "config.json")))
+	return nil
+}
+
 func cmdConfig(args []string) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -241,8 +380,7 @@ func cmdConfig(args []string) error {
 	}
 
 	if len(args) == 0 {
-		cfg.Print()
-		return nil
+		return cmdConfigInteractive(cfg)
 	}
 
 	switch args[0] {
@@ -270,6 +408,8 @@ func cmdConfig(args []string) error {
 			cfg.Model = "gpt-5-nano"
 		case "ollama":
 			cfg.Model = selectOllamaModel(cfg.Model)
+		case "fastvlm":
+			cfg.Model = "fastvlm-0.5b"
 		}
 		if err := cfg.Save(); err != nil {
 			return err
@@ -353,10 +493,700 @@ func cmdConfig(args []string) error {
 		}
 		fmt.Printf("%s Stream mode: %v\n", ui.Success.Render("✓"), cfg.Stream)
 
+	case "timeout":
+		if len(args) < 2 {
+			fmt.Printf("Current timeout: %ds\n", cfg.Timeout)
+			return nil
+		}
+		var n int
+		if _, err := fmt.Sscanf(args[1], "%d", &n); err != nil || n < 1 {
+			return fmt.Errorf("invalid timeout: must be a number >= 1 (seconds)")
+		}
+		cfg.Timeout = n
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Printf("%s Timeout set to: %ds\n", ui.Success.Render("✓"), n)
+
 	default:
-		return fmt.Errorf("unknown config key %q — use: provider, model, apikey, or-provider, max-input, stream", args[0])
+		return fmt.Errorf("unknown config key %q — use: provider, model, apikey, or-provider, max-input, stream, timeout", args[0])
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// tune reset — remove all tune config and shell integration
+// ---------------------------------------------------------------------------
+
+func cmdReset() error {
+	fmt.Println(ui.Title.Render("🎼 Tune Reset"))
+	fmt.Println()
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	tuneDir := filepath.Join(home, ".tune")
+
+	// Show what will be removed
+	fmt.Println(ui.Subtitle.Render("This will remove:"))
+	fmt.Printf("  %s %s\n", ui.Warning.Render("•"), tuneDir)
+
+	// Find shell profiles with tune init
+	shellProfiles := []string{
+		filepath.Join(home, ".zshrc"),
+		filepath.Join(home, ".bashrc"),
+		filepath.Join(home, ".bash_profile"),
+	}
+	var affectedProfiles []string
+	for _, p := range shellProfiles {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(data), "tune init") {
+			affectedProfiles = append(affectedProfiles, p)
+			fmt.Printf("  %s tune init lines from %s\n", ui.Warning.Render("•"), p)
+		}
+	}
+
+	fmt.Println()
+	fmt.Print(ui.Warning.Render("Are you sure? [y/N] "))
+
+	var input string
+	fmt.Scanln(&input)
+	input = strings.TrimSpace(strings.ToLower(input))
+	if input != "y" && input != "yes" {
+		fmt.Println(ui.Faint.Render("Cancelled."))
+		return nil
+	}
+
+	// Remove tune init lines from shell profiles
+	for _, p := range affectedProfiles {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(data), "\n")
+		var cleaned []string
+		for _, line := range lines {
+			// Skip the comment line and the eval line
+			if strings.Contains(line, "Tune — AI command output filter") || strings.Contains(line, "tune init") {
+				continue
+			}
+			cleaned = append(cleaned, line)
+		}
+		if err := os.WriteFile(p, []byte(strings.Join(cleaned, "\n")), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "  %s Could not clean %s: %v\n", ui.Warning.Render("!"), p, err)
+		} else {
+			fmt.Printf("  %s Cleaned %s\n", ui.Success.Render("✓"), p)
+		}
+	}
+
+	// Remove ~/.tune directory
+	if err := os.RemoveAll(tuneDir); err != nil {
+		fmt.Fprintf(os.Stderr, "  %s Could not remove %s: %v\n", ui.Warning.Render("!"), tuneDir, err)
+	} else {
+		fmt.Printf("  %s Removed %s\n", ui.Success.Render("✓"), tuneDir)
+	}
+
+	fmt.Println()
+	fmt.Println(ui.Success.Render("✓ Tune has been reset. Restart your shell to complete."))
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// tune enable / disable — toggle filtering globally
+// ---------------------------------------------------------------------------
+
+func cmdEnable() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	cfg.SetEnabled(true)
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("%s Tune filtering enabled\n", ui.Success.Render("✓"))
+	return nil
+}
+
+func cmdDisable() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	cfg.SetEnabled(false)
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+	fmt.Printf("%s Tune filtering disabled (commands pass through unfiltered)\n", ui.Warning.Render("!"))
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// tune fastvlm — setup/status/remove FastVLM Claude Code hook
+// ---------------------------------------------------------------------------
+
+const hookScript = `#!/usr/bin/env bash
+# FastVLM image hook — intercepts Claude Code Read calls on image files.
+# Sends image to FastVLM (Apple Silicon Neural Engine) for fast local vision,
+# returns description to the main model instead of raw image bytes.
+# Managed by: tune fastvlm setup
+
+if ! command -v jq &>/dev/null; then
+  exit 0
+fi
+
+INPUT=$(cat)
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+
+if [ -z "$FILE_PATH" ]; then
+  exit 0
+fi
+
+# Check if file is an image by extension (case-insensitive)
+EXT="${FILE_PATH##*.}"
+EXT=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+case "$EXT" in
+  png|jpg|jpeg|gif|webp|bmp|tiff|tif)
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+
+# Check file actually exists
+if [ ! -f "$FILE_PATH" ]; then
+  exit 0
+fi
+
+FASTVLM="$HOME/bin/fastvlm-cli"
+if [ ! -x "$FASTVLM" ]; then
+  exit 0
+fi
+
+DESCRIPTION=$("$FASTVLM" "$FILE_PATH" \
+  --prompt "Describe this image comprehensively for a coding AI agent that cannot see it. Include: 1) Full OCR of all visible text, preserving layout and indentation 2) Visual context: what the image shows (terminal, browser, UI, diagram, etc), layout, colors 3) Actionable details: error messages, file paths, line numbers, URLs, button labels, status indicators. Be thorough and preserve exact text." \
+  --model-path "$HOME/ml-fastvlm/app/FastVLM/model" \
+  --max-tokens 240 \
+  2>/dev/null)
+
+if [ -z "$DESCRIPTION" ]; then
+  # Failed — let Claude read the image normally
+  exit 0
+fi
+
+# Block the Read and return the description instead
+jq -n \
+  --arg desc "$DESCRIPTION" \
+  '{
+    "hookSpecificOutput": {
+      "hookEventName": "PreToolUse",
+      "permissionDecision": "block",
+      "permissionDecisionReason": ("[fastvlm] " + $desc)
+    }
+  }'
+`
+
+func cmdFastVLM(args []string) error {
+	if len(args) == 0 {
+		return cmdFastVLMStatus()
+	}
+
+	switch args[0] {
+	case "setup":
+		return cmdFastVLMSetup()
+	case "status":
+		return cmdFastVLMStatus()
+	case "remove":
+		return cmdFastVLMRemove()
+	default:
+		return fmt.Errorf("unknown fastvlm subcommand %q — use: setup, status, remove", args[0])
+	}
+}
+
+func cmdFastVLMStatus() error {
+	home, _ := os.UserHomeDir()
+	fmt.Println(ui.Title.Render("🚀 FastVLM Status"))
+	fmt.Println()
+
+	// Check binary
+	bin := filepath.Join(home, "bin", "fastvlm-cli")
+	if _, err := os.Stat(bin); err == nil {
+		fmt.Printf("  %s fastvlm-cli binary: %s\n", ui.Success.Render("✓"), bin)
+	} else {
+		fmt.Printf("  %s fastvlm-cli binary not found at %s\n", ui.Warning.Render("✗"), bin)
+		fmt.Printf("    Build: cd ~/fastvlm-cli && swift build -c release && cp .build/release/fastvlm-cli ~/bin/\n")
+	}
+
+	// Check metallib
+	metallib := filepath.Join(home, "bin", "mlx.metallib")
+	if _, err := os.Stat(metallib); err == nil {
+		fmt.Printf("  %s Metal shaders: %s\n", ui.Success.Render("✓"), metallib)
+	} else {
+		fmt.Printf("  %s Metal shaders not found at %s\n", ui.Warning.Render("✗"), metallib)
+	}
+
+	// Check model
+	modelDir := filepath.Join(home, "ml-fastvlm/app/FastVLM/model")
+	configFile := filepath.Join(modelDir, "config.json")
+	if _, err := os.Stat(configFile); err == nil {
+		fmt.Printf("  %s Model: %s\n", ui.Success.Render("✓"), modelDir)
+	} else {
+		fmt.Printf("  %s Model not found at %s\n", ui.Warning.Render("✗"), modelDir)
+		fmt.Printf("    Download: cd ~/ml-fastvlm/app && ./get_pretrained_mlx_model.sh --model 0.5b --dest FastVLM/model\n")
+	}
+
+	// Check hook script
+	hookPath := filepath.Join(home, ".claude", "hooks", "tune-image.sh")
+	if data, err := os.ReadFile(hookPath); err == nil {
+		if strings.Contains(string(data), "fastvlm-cli") {
+			fmt.Printf("  %s Hook script: %s (fastvlm)\n", ui.Success.Render("✓"), hookPath)
+		} else {
+			fmt.Printf("  %s Hook script exists but not using fastvlm: %s\n", ui.Warning.Render("!"), hookPath)
+		}
+	} else {
+		fmt.Printf("  %s Hook script not found: %s\n", ui.Warning.Render("✗"), hookPath)
+	}
+
+	// Check Claude Code settings
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if data, err := os.ReadFile(settingsPath); err == nil {
+		if strings.Contains(string(data), "tune-image.sh") {
+			fmt.Printf("  %s Claude Code hook registered\n", ui.Success.Render("✓"))
+		} else {
+			fmt.Printf("  %s Claude Code hook not registered in settings.json\n", ui.Warning.Render("✗"))
+		}
+	} else {
+		fmt.Printf("  %s Claude Code settings not found: %s\n", ui.Warning.Render("✗"), settingsPath)
+	}
+
+	fmt.Println()
+	fmt.Println(ui.Faint.Render("  Run 'tune fastvlm setup' to install/fix everything"))
+	return nil
+}
+
+func cmdFastVLMSetup() error {
+	home, _ := os.UserHomeDir()
+	fmt.Println(ui.Title.Render("🚀 FastVLM Setup"))
+	fmt.Println(ui.Faint.Render("  Installing FastVLM for local Neural Engine image processing"))
+	fmt.Println()
+
+	binDir := filepath.Join(home, "bin")
+	bin := filepath.Join(binDir, "fastvlm-cli")
+	metallib := filepath.Join(binDir, "mlx.metallib")
+	projectDir := filepath.Join(home, "fastvlm-cli")
+	repoDir := filepath.Join(home, "ml-fastvlm")
+	modelDir := filepath.Join(repoDir, "app", "FastVLM", "model")
+
+	// Step 1: Check prerequisites
+	fmt.Println(ui.Subtitle.Render("Checking prerequisites"))
+
+	if err := runQuiet("xcode-select", "-p"); err != nil {
+		return fmt.Errorf("Xcode Command Line Tools not installed.\n  Run: xcode-select --install")
+	}
+	fmt.Printf("  %s Xcode Command Line Tools\n", ui.Success.Render("✓"))
+
+	if err := runQuiet("swift", "--version"); err != nil {
+		return fmt.Errorf("Swift not found. Install Xcode or Xcode Command Line Tools.")
+	}
+	fmt.Printf("  %s Swift compiler\n", ui.Success.Render("✓"))
+
+	if err := runQuiet("xcrun", "-sdk", "macosx", "metal", "--version"); err != nil {
+		fmt.Printf("  %s Metal toolchain not found, downloading...\n", ui.Warning.Render("!"))
+		if err := runVisible("xcodebuild", "-downloadComponent", "MetalToolchain"); err != nil {
+			return fmt.Errorf("failed to download Metal toolchain: %w", err)
+		}
+	}
+	fmt.Printf("  %s Metal toolchain\n", ui.Success.Render("✓"))
+	fmt.Println()
+
+	// Step 2: Clone ml-fastvlm repo (for model download script + mlpackage)
+	fmt.Println(ui.Subtitle.Render("Model repository"))
+
+	if _, err := os.Stat(filepath.Join(repoDir, "app")); err != nil {
+		fmt.Printf("  Cloning ml-fastvlm...\n")
+		if err := runVisible("git", "clone", "https://github.com/apple/ml-fastvlm.git", repoDir); err != nil {
+			return fmt.Errorf("failed to clone ml-fastvlm: %w", err)
+		}
+	}
+	fmt.Printf("  %s ml-fastvlm repo: %s\n", ui.Success.Render("✓"), repoDir)
+
+	// Step 3: Download 0.5B model
+	if _, err := os.Stat(filepath.Join(modelDir, "config.json")); err != nil {
+		fmt.Printf("  Downloading 0.5B model (~1GB)...\n")
+		if err := downloadModel(repoDir, modelDir); err != nil {
+			return fmt.Errorf("model download failed: %w", err)
+		}
+	}
+	fmt.Printf("  %s Model: %s\n", ui.Success.Render("✓"), modelDir)
+	fmt.Println()
+
+	// Step 4: Write Swift CLI source (embedded in tune binary)
+	fmt.Println(ui.Subtitle.Render("Building fastvlm-cli"))
+
+	if err := writeSwiftSources(projectDir); err != nil {
+		return fmt.Errorf("failed to write Swift sources: %w", err)
+	}
+	fmt.Printf("  %s Swift sources written to %s\n", ui.Success.Render("✓"), projectDir)
+
+	// Step 5: Build
+	if _, err := os.Stat(bin); err != nil {
+		fmt.Printf("  Building (this takes a few minutes on first run)...\n")
+		cmd := exec.Command("swift", "build", "-c", "release")
+		cmd.Dir = projectDir
+		cmd.Stdout = os.Stderr
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("swift build failed: %w", err)
+		}
+
+		// Copy binary
+		if err := os.MkdirAll(binDir, 0755); err != nil {
+			return err
+		}
+		buildBin := filepath.Join(projectDir, ".build", "release", "fastvlm-cli")
+		if err := copyFile(buildBin, bin); err != nil {
+			return fmt.Errorf("failed to install binary: %w", err)
+		}
+	}
+	fmt.Printf("  %s fastvlm-cli: %s\n", ui.Success.Render("✓"), bin)
+
+	// Step 6: Compile Metal shaders into metallib
+	if _, err := os.Stat(metallib); err != nil {
+		fmt.Printf("  Compiling Metal shaders...\n")
+		if err := compileMetallib(projectDir, metallib); err != nil {
+			return fmt.Errorf("metallib compilation failed: %w", err)
+		}
+	}
+	fmt.Printf("  %s Metal shaders: %s\n", ui.Success.Render("✓"), metallib)
+	fmt.Println()
+
+	// Step 7: Write hook script
+	fmt.Println(ui.Subtitle.Render("Claude Code integration"))
+
+	hookDir := filepath.Join(home, ".claude", "hooks")
+	if err := os.MkdirAll(hookDir, 0755); err != nil {
+		return fmt.Errorf("failed to create hooks dir: %w", err)
+	}
+	hookPath := filepath.Join(hookDir, "tune-image.sh")
+	if err := os.WriteFile(hookPath, []byte(hookScript), 0755); err != nil {
+		return fmt.Errorf("failed to write hook script: %w", err)
+	}
+	fmt.Printf("  %s Hook script: %s\n", ui.Success.Render("✓"), hookPath)
+
+	// Step 8: Register hook in Claude Code settings
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := ensureClaudeCodeHook(settingsPath, hookPath); err != nil {
+		fmt.Printf("  %s Could not update Claude Code settings: %v\n", ui.Warning.Render("!"), err)
+		fmt.Printf("    Add manually to %s\n", settingsPath)
+	} else {
+		fmt.Printf("  %s Claude Code hook registered\n", ui.Success.Render("✓"))
+	}
+
+	fmt.Println()
+	fmt.Println(ui.Success.Render("✓ FastVLM is ready"))
+	fmt.Println(ui.Faint.Render("  Every Claude Code image Read now goes through FastVLM (~5s, local Neural Engine)"))
+	fmt.Println(ui.Faint.Render("  Test: tune image --provider fastvlm ~/Desktop/screenshot.png"))
+	fmt.Println(ui.Faint.Render("  Remove: tune fastvlm remove"))
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// FastVLM setup helpers
+// ---------------------------------------------------------------------------
+
+func runQuiet(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd.Run()
+}
+
+func runVisible(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0755)
+}
+
+func writeSwiftSources(projectDir string) error {
+	srcDir := filepath.Join(projectDir, "Sources", "fastvlm-cli")
+	if err := os.MkdirAll(srcDir, 0755); err != nil {
+		return err
+	}
+
+	files := map[string][]byte{
+		filepath.Join(projectDir, "Package.swift"):                     fastvlm.PackageSwift,
+		filepath.Join(srcDir, "FastVLM.swift"):                         fastvlm.FastVLMSwift,
+		filepath.Join(srcDir, "FastVLMCLI.swift"):                      fastvlm.FastVLMCLISwift,
+		filepath.Join(srcDir, "MediaProcessingExtensions.swift"):       fastvlm.MediaProcessingExtensionsSwift,
+	}
+
+	for path, content := range files {
+		if err := os.WriteFile(path, content, 0644); err != nil {
+			return fmt.Errorf("writing %s: %w", filepath.Base(path), err)
+		}
+	}
+	return nil
+}
+
+func downloadModel(_, modelDir string) error {
+	modelURL := "https://ml-site.cdn-apple.com/datasets/fastvlm/llava-fastvithd_0.5b_stage3_llm.fp16.zip"
+
+	if err := os.MkdirAll(modelDir, 0755); err != nil {
+		return err
+	}
+
+	tmpDir, err := os.MkdirTemp("", "fastvlm-model-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	zipPath := filepath.Join(tmpDir, "model.zip")
+
+	// Download with curl (available on all macOS)
+	fmt.Fprintf(os.Stderr, "  Downloading from Apple CDN...\n")
+	if err := runVisible("curl", "-L", "--progress-bar", "-o", zipPath, modelURL); err != nil {
+		return fmt.Errorf("download failed: %w", err)
+	}
+
+	// Extract
+	fmt.Fprintf(os.Stderr, "  Extracting...\n")
+	extractDir := filepath.Join(tmpDir, "extracted")
+	if err := os.MkdirAll(extractDir, 0755); err != nil {
+		return err
+	}
+	if err := runVisible("unzip", "-q", zipPath, "-d", extractDir); err != nil {
+		return fmt.Errorf("unzip failed: %w", err)
+	}
+
+	// The zip contains a directory named like the model — find and copy contents
+	entries, err := os.ReadDir(extractDir)
+	if err != nil {
+		return err
+	}
+	srcDir := extractDir
+	for _, e := range entries {
+		if e.IsDir() {
+			srcDir = filepath.Join(extractDir, e.Name())
+			break
+		}
+	}
+
+	// Copy all files from extracted dir to model dir
+	modelEntries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return err
+	}
+	for _, e := range modelEntries {
+		src := filepath.Join(srcDir, e.Name())
+		dst := filepath.Join(modelDir, e.Name())
+		if e.IsDir() {
+			// Copy directory recursively (for mlpackage)
+			if err := runQuiet("cp", "-r", src, dst); err != nil {
+				return fmt.Errorf("copying %s: %w", e.Name(), err)
+			}
+		} else {
+			data, err := os.ReadFile(src)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(dst, data, 0644); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func compileMetallib(projectDir, outputPath string) error {
+	metalDir := filepath.Join(projectDir, ".build", "checkouts", "mlx-swift", "Source", "Cmlx", "mlx-generated", "metal")
+	kernelsDir := filepath.Join(projectDir, ".build", "checkouts", "mlx-swift", "Source", "Cmlx", "mlx", "mlx", "backend", "metal", "kernels")
+
+	// Find all .metal files
+	var metalFiles []string
+	err := filepath.Walk(metalDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && strings.HasSuffix(path, ".metal") {
+			metalFiles = append(metalFiles, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("finding metal files: %w", err)
+	}
+
+	if len(metalFiles) == 0 {
+		return fmt.Errorf("no .metal files found in %s (run swift build first)", metalDir)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "mlx-air-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Compile each .metal to .air
+	for _, f := range metalFiles {
+		base := strings.TrimSuffix(filepath.Base(f), ".metal")
+		airPath := filepath.Join(tmpDir, base+".air")
+		if err := runQuiet("xcrun", "-sdk", "macosx", "metal", "-c", f,
+			"-I", kernelsDir, "-I", filepath.Dir(kernelsDir),
+			"-o", airPath); err != nil {
+			return fmt.Errorf("compiling %s: %w", filepath.Base(f), err)
+		}
+	}
+
+	// Link all .air into metallib
+	airFiles, _ := filepath.Glob(filepath.Join(tmpDir, "*.air"))
+	args := append([]string{"-sdk", "macosx", "metallib"}, airFiles...)
+	args = append(args, "-o", outputPath)
+	if err := runQuiet("xcrun", args...); err != nil {
+		return fmt.Errorf("linking metallib: %w", err)
+	}
+
+	return nil
+}
+
+func cmdFastVLMRemove() error {
+	home, _ := os.UserHomeDir()
+	fmt.Println(ui.Title.Render("🚀 FastVLM Remove"))
+	fmt.Println()
+
+	// Remove hook script
+	hookPath := filepath.Join(home, ".claude", "hooks", "tune-image.sh")
+	if err := os.Remove(hookPath); err == nil {
+		fmt.Printf("  %s Removed hook script: %s\n", ui.Success.Render("✓"), hookPath)
+	} else if !os.IsNotExist(err) {
+		fmt.Printf("  %s Could not remove %s: %v\n", ui.Warning.Render("!"), hookPath, err)
+	}
+
+	// Remove hook from Claude Code settings
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := removeClaudeCodeHook(settingsPath); err != nil {
+		fmt.Printf("  %s Could not update Claude Code settings: %v\n", ui.Warning.Render("!"), err)
+	} else {
+		fmt.Printf("  %s Claude Code hook unregistered\n", ui.Success.Render("✓"))
+	}
+
+	fmt.Println()
+	fmt.Println(ui.Success.Render("✓ FastVLM hook removed"))
+	fmt.Println(ui.Faint.Render("  Claude Code will read images normally (raw pixels to model)"))
+	return nil
+}
+
+// ensureClaudeCodeHook adds the tune-image.sh hook to Claude Code settings if not already present.
+func ensureClaudeCodeHook(settingsPath, hookPath string) error {
+	var settings map[string]any
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			settings = map[string]any{}
+		} else {
+			return err
+		}
+	} else {
+		if err := json.Unmarshal(data, &settings); err != nil {
+			return fmt.Errorf("failed to parse settings.json: %w", err)
+		}
+	}
+
+	// Check if hook already registered
+	if strings.Contains(string(data), "tune-image.sh") {
+		return nil // already there
+	}
+
+	// Build the hook entry
+	hookEntry := map[string]any{
+		"matcher": "Read",
+		"hooks": []any{
+			map[string]any{
+				"type":    "command",
+				"command": hookPath,
+			},
+		},
+	}
+
+	// Get or create hooks.PreToolUse
+	hooks, _ := settings["hooks"].(map[string]any)
+	if hooks == nil {
+		hooks = map[string]any{}
+		settings["hooks"] = hooks
+	}
+
+	preToolUse, _ := hooks["PreToolUse"].([]any)
+	preToolUse = append(preToolUse, hookEntry)
+	hooks["PreToolUse"] = preToolUse
+
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(settingsPath, out, 0644)
+}
+
+// removeClaudeCodeHook removes the tune-image.sh hook from Claude Code settings.
+func removeClaudeCodeHook(settingsPath string) error {
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return nil // no settings file, nothing to remove
+	}
+
+	var settings map[string]any
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return err
+	}
+
+	hooks, _ := settings["hooks"].(map[string]any)
+	if hooks == nil {
+		return nil
+	}
+
+	preToolUse, _ := hooks["PreToolUse"].([]any)
+	if preToolUse == nil {
+		return nil
+	}
+
+	// Filter out entries that reference tune-image.sh
+	var filtered []any
+	for _, entry := range preToolUse {
+		entryJSON, _ := json.Marshal(entry)
+		if !strings.Contains(string(entryJSON), "tune-image.sh") {
+			filtered = append(filtered, entry)
+		}
+	}
+
+	if len(filtered) == 0 {
+		delete(hooks, "PreToolUse")
+	} else {
+		hooks["PreToolUse"] = filtered
+	}
+
+	if len(hooks) == 0 {
+		delete(settings, "hooks")
+	}
+
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(settingsPath, out, 0644)
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +1195,9 @@ func cmdConfig(args []string) error {
 
 func cmdImage(args []string) error {
 	intent := ""
+	providerOverride := ""
+	modelOverride := ""
+	timeoutOverride := 0
 	var imagePath string
 
 	for i := 0; i < len(args); i++ {
@@ -374,13 +1207,28 @@ func cmdImage(args []string) error {
 				i++
 				intent = args[i]
 			}
+		case "--provider":
+			if i+1 < len(args) {
+				i++
+				providerOverride = args[i]
+			}
+		case "--model":
+			if i+1 < len(args) {
+				i++
+				modelOverride = args[i]
+			}
+		case "--timeout", "-t":
+			if i+1 < len(args) {
+				i++
+				fmt.Sscanf(args[i], "%d", &timeoutOverride)
+			}
 		default:
 			imagePath = args[i]
 		}
 	}
 
 	if imagePath == "" {
-		return fmt.Errorf("usage: tune image [-i intent] <image-path>")
+		return fmt.Errorf("usage: tune image [-i intent] [--provider <provider>] [--model <model>] [--timeout <seconds>] <image-path>")
 	}
 
 	imageData, err := os.ReadFile(imagePath)
@@ -398,7 +1246,19 @@ func cmdImage(args []string) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if providerOverride != "" {
+		cfg.Provider = providerOverride
+	}
+	if modelOverride != "" {
+		cfg.Model = modelOverride
+	}
+
+	timeout := cfg.Timeout
+	if timeoutOverride > 0 {
+		timeout = timeoutOverride
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 	defer cancel()
 
 	result, err := filter.FilterImage(ctx, cfg, imageData, mimeType, intent)
@@ -424,6 +1284,21 @@ func cmdImage(args []string) error {
 // ---------------------------------------------------------------------------
 
 func cmdFilter(args []string) error {
+	cfgCheck, err := config.Load()
+	if err == nil && !cfgCheck.IsEnabled() {
+		// Tune disabled — run command directly without filtering
+		cmd := exec.Command("sh", "-c", strings.Join(args, " "))
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		cmd.Run()
+		exitCode := 0
+		if cmd.ProcessState != nil {
+			exitCode = cmd.ProcessState.ExitCode()
+		}
+		os.Exit(exitCode)
+	}
+
 	intent := ""
 	passthrough := false
 	streamOverride := 0 // 0=use config, 1=force on, -1=force off
@@ -464,7 +1339,7 @@ func cmdFilter(args []string) error {
 		return err
 	}
 
-	if cfg.ActiveAPIKey() == "" && cfg.Provider != "ollama" {
+	if cfg.ActiveAPIKey() == "" && cfg.Provider != "ollama" && cfg.Provider != "fastvlm" {
 		return fmt.Errorf("no API key: set via 'tune config apikey <key>' or TUNE_API_KEY env var")
 	}
 
@@ -509,7 +1384,7 @@ func cmdFilter(args []string) error {
 		os.Exit(exitCode)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Timeout)*time.Second)
 	defer cancel()
 
 	var result *filter.Result
@@ -582,7 +1457,7 @@ func cmdFilterStreaming(cfg *config.Config, cmdArgs []string, cmdStr, cwd, inten
 		exitCodeCh <- exitCode
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Timeout)*time.Second)
 	defer cancel()
 
 	cc := filter.DefaultChunkedConfig()
@@ -817,16 +1692,22 @@ func printUsage() {
 	fmt.Println(cmd("tune image <image-path>         ", "Filter/extract info from image"))
 	fmt.Println(cmd("tune gain                       ", "Show token savings stats"))
 	fmt.Println(cmd("tune gain --history             ", "Show command history"))
+	fmt.Println(cmd("tune enable                     ", "Enable filtering (default)"))
+	fmt.Println(cmd("tune disable                    ", "Disable filtering (passthrough)"))
+	fmt.Println(cmd("tune fastvlm setup              ", "Install FastVLM hook for Claude Code images"))
+	fmt.Println(cmd("tune fastvlm status             ", "Check FastVLM installation status"))
+	fmt.Println(cmd("tune fastvlm remove             ", "Remove FastVLM hook"))
 	fmt.Println()
 
 	fmt.Println(section("Configuration"))
 	fmt.Println(cmd("tune config                     ", "Show current config"))
-	fmt.Println(cmd("tune config provider <name>     ", "Set provider (openrouter, openai, anthropic, gemini, ollama)"))
+	fmt.Println(cmd("tune config provider <name>     ", "Set provider (openrouter, openai, anthropic, gemini, ollama, fastvlm)"))
 	fmt.Println(cmd("tune config model <model>       ", "Set model"))
 	fmt.Println(cmd("tune config apikey <key>        ", "Set API key for current provider"))
 	fmt.Println(cmd("tune config apikey <prov> <key> ", "Set API key for specific provider"))
 	fmt.Println(cmd("tune config or-provider <name>  ", "Set OpenRouter sub-provider (e.g. groq)"))
 	fmt.Println(cmd("tune config max-input <chars>   ", "Set max input chars"))
+	fmt.Println(cmd("tune config timeout <seconds>   ", "Set filter timeout (default: 5s)"))
 	fmt.Println()
 
 	fmt.Println(section("Command Registration"))
@@ -834,6 +1715,7 @@ func printUsage() {
 	fmt.Println(cmd("tune remove <command>           ", "Unregister a command"))
 	fmt.Println(cmd("tune list                       ", "Show registered commands"))
 	fmt.Println(cmd("tune init                       ", "Output shell functions (eval this)"))
+	fmt.Println(cmd("tune reset                      ", "Remove all tune config and shell integration"))
 	fmt.Println()
 
 	fmt.Println(section("Quick Start"))

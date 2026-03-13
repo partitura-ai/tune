@@ -16,6 +16,21 @@ type Config struct {
 	APIKeys            map[string]string `json:"api_keys"`
 	MaxInput           int               `json:"max_input"`
 	Stream             bool              `json:"stream"`
+	Timeout            int               `json:"timeout"`
+	Enabled            *bool             `json:"enabled,omitempty"`
+}
+
+// IsEnabled returns whether tune filtering is enabled (default: true).
+func (c *Config) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+// SetEnabled sets the enabled state.
+func (c *Config) SetEnabled(v bool) {
+	c.Enabled = &v
 }
 
 func DefaultConfig() Config {
@@ -26,6 +41,7 @@ func DefaultConfig() Config {
 		APIKeys:            map[string]string{},
 		MaxInput:           16000,
 		Stream:             true,
+		Timeout:            5,
 	}
 }
 
@@ -59,6 +75,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.MaxInput == 0 {
 		cfg.MaxInput = 16000
+	}
+	if cfg.Timeout == 0 {
+		cfg.Timeout = 5
 	}
 
 	// Env vars fill in missing keys (config file takes precedence)
@@ -109,19 +128,20 @@ func (c *Config) ActiveAPIKey() string {
 // Print displays the current configuration.
 func (c *Config) Print() {
 	authStatus := ""
-	if c.Provider == "ollama" {
+	if c.Provider == "ollama" || c.Provider == "fastvlm" {
 		authStatus = ui.Success.Render("local (no key needed)")
 	} else if key := c.APIKeys[c.Provider]; key != "" {
-		authStatus = ui.Success.Render(maskKey(key))
+		authStatus = ui.Success.Render(MaskKey(key))
 	} else {
 		authStatus = ui.Warning.Render("(no key — run 'tune config apikey <key>')")
 	}
 
 	content := fmt.Sprintf(
-		"%s  %s\n%s  %s\n%s  %s\n%s  %s\n\n%s  %s",
+		"%s  %s\n%s  %s\n%s  %s\n%s  %s\n%s  %s\n\n%s  %s",
 		ui.Label.Render("Provider: "), ui.Value.Render(c.Provider),
 		ui.Label.Render("Model:    "), ui.Value.Render(c.Model),
 		ui.Label.Render("Stream:   "), ui.Value.Render(fmt.Sprintf("%v", c.Stream)),
+		ui.Label.Render("Timeout:  "), ui.Value.Render(fmt.Sprintf("%ds", c.Timeout)),
 		ui.Label.Render("Max input:"), ui.Value.Render(fmt.Sprintf("%d chars", c.MaxInput)),
 		ui.Label.Render("Auth:     "), authStatus,
 	)
@@ -131,16 +151,47 @@ func (c *Config) Print() {
 	fmt.Println(ui.Faint.Render("  " + configPath()))
 }
 
-func maskKey(key string) string {
+func MaskKey(key string) string {
 	if len(key) <= 8 {
 		return "****"
 	}
 	return key[:4] + "..." + key[len(key)-4:]
 }
 
+// EnvVarForProvider returns the environment variable name for a provider's API key.
+func EnvVarForProvider(provider string) string {
+	m := map[string]string{
+		"openrouter": "OPENROUTER_API_KEY",
+		"openai":     "OPENAI_API_KEY",
+		"anthropic":  "ANTHROPIC_API_KEY",
+		"gemini":     "GEMINI_API_KEY",
+	}
+	return m[provider]
+}
+
+// DefaultModelForProvider returns the default model for a given provider.
+func DefaultModelForProvider(provider string) string {
+	switch provider {
+	case "openrouter":
+		return "openai/gpt-oss-20b"
+	case "anthropic":
+		return "claude-haiku-4-5-20251001"
+	case "gemini":
+		return "gemini-2.5-flash-lite"
+	case "openai":
+		return "gpt-5-nano"
+	case "ollama":
+		return "qwen3.5:9b"
+	case "fastvlm":
+		return "fastvlm-0.5b"
+	default:
+		return ""
+	}
+}
+
 // Providers returns valid provider names.
 func Providers() []string {
-	return []string{"openrouter", "ollama", "openai", "anthropic", "gemini"}
+	return []string{"openrouter", "ollama", "openai", "anthropic", "gemini", "fastvlm"}
 }
 
 // ValidProvider checks if a provider name is valid.
