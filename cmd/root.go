@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/term"
+
 	"github.com/partitura-ai/tune/config"
 	"github.com/partitura-ai/tune/fastvlm"
 	"github.com/partitura-ai/tune/filter"
@@ -21,7 +23,7 @@ import (
 	"github.com/partitura-ai/tune/ui"
 )
 
-const version = "1.4.0"
+const version = "1.4.1"
 
 func Execute() error {
 	args := os.Args[1:]
@@ -1297,20 +1299,33 @@ func cmdImage(args []string) error {
 // tune <command> — filter
 // ---------------------------------------------------------------------------
 
+func isTerminal(fd uintptr) bool {
+	return term.IsTerminal(int(fd))
+}
+
+func runPassthrough(args []string) {
+	cmd := exec.Command("sh", "-c", strings.Join(args, " "))
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.Run()
+	exitCode := 0
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
+	os.Exit(exitCode)
+}
+
 func cmdFilter(args []string) error {
 	cfgCheck, err := config.Load()
 	if err == nil && !cfgCheck.IsEnabled() {
-		// Tune disabled — run command directly without filtering
-		cmd := exec.Command("sh", "-c", strings.Join(args, " "))
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.Stdin = os.Stdin
-		cmd.Run()
-		exitCode := 0
-		if cmd.ProcessState != nil {
-			exitCode = cmd.ProcessState.ExitCode()
-		}
-		os.Exit(exitCode)
+		runPassthrough(args)
+	}
+
+	// No TTY on stderr — non-interactive context (e.g. vcs_info, scripts).
+	// Skip filtering to avoid polluting programmatic callers.
+	if !isTerminal(os.Stderr.Fd()) {
+		runPassthrough(args)
 	}
 
 	intent := ""
