@@ -25,18 +25,25 @@ CRITICAL rules:
 const finalChunkSystemPrompt = `You are a command output filter for AI coding agents. This is the FINAL chunk of command output. The command has finished.
 
 CRITICAL rules:
-- If exit code is 0 AND no errors in this chunk: respond with ONLY "PASS"
+- If exit code is 0 AND no errors in this chunk: respond with a ONE-LINE summary with key metrics. Examples:
+  "47 tests pass across 10 packages"
+  "compiled 12 packages"
+  "3 files changed, 47 insertions(+), 12 deletions(-)"
+  Count real numbers from the output. Include test count, package count, or other concrete metrics. ONE line only.
 - If exit code is non-zero OR there are errors: output every error message, failed test name, file path, and line number
 - If errors were already reported in previous chunks, just report any NEW errors in this chunk, plus a one-line summary like "N total failures"
 - Strip: progress bars, timing info, "=== RUN" lines, "--- PASS" lines
 - Keep EXACTLY: failed test names, assertion errors, compiler errors, stack traces, file:line references
+- Do NOT add symbols like ✔ or ✖ — just the text
 - Do NOT add commentary — output ONLY the filtered result
 - Do NOT wrap in markdown code blocks`
 
 // ChunkedConfig controls when chunks are flushed to the LLM.
 type ChunkedConfig struct {
-	FlushInterval time.Duration // max time to accumulate before flushing
-	FlushBytes    int           // max bytes to accumulate before flushing
+	FlushInterval time.Duration     // max time to accumulate before flushing
+	FlushBytes    int               // max bytes to accumulate before flushing
+	OnLine        func(line string) // called for each raw output line (for preview display)
+	OnFlush       func()            // called before each LLM call (to clear preview, etc.)
 }
 
 func DefaultChunkedConfig() ChunkedConfig {
@@ -115,6 +122,10 @@ func FilterChunked(
 			userMsg = fmt.Sprintf("Ongoing output chunk (%d chars):\n\n%s", len(chunk), truncated)
 		}
 
+		if cc.OnFlush != nil {
+			cc.OnFlush()
+		}
+
 		start := time.Now()
 		filtered, err := streamChunk(ctx, cfg, apiKey, sysPrompt, userMsg, w)
 		elapsed := time.Since(start)
@@ -168,6 +179,9 @@ func FilterChunked(
 					FilterTime:     totalTime,
 					ChunkCount:     chunkCount,
 				}, nil
+			}
+			if cc.OnLine != nil {
+				cc.OnLine(line)
 			}
 			mu.Lock()
 			buf.WriteString(line)

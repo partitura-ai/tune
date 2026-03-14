@@ -21,7 +21,7 @@ import (
 	"github.com/partitura-ai/tune/ui"
 )
 
-const version = "1.3.0"
+const version = "1.4.0"
 
 func Execute() error {
 	args := os.Args[1:]
@@ -409,7 +409,7 @@ func cmdConfig(args []string) error {
 		case "ollama":
 			cfg.Model = selectOllamaModel(cfg.Model)
 		case "fastvlm":
-			cfg.Model = "fastvlm-0.5b"
+			cfg.Model = "fastvlm-1.5b"
 		}
 		if err := cfg.Save(); err != nil {
 			return err
@@ -630,9 +630,9 @@ func cmdDisable() error {
 // ---------------------------------------------------------------------------
 
 const hookScript = `#!/usr/bin/env bash
-# FastVLM image hook — intercepts Claude Code Read calls on image files.
-# Sends image to FastVLM (Apple Silicon Neural Engine) for fast local vision,
-# returns description to the main model instead of raw image bytes.
+# Tune image hook — intercepts Claude Code Read calls on image files.
+# Uses tune CLI to process images via OpenRouter (cheap, high quality)
+# with FastVLM as local fallback.
 # Managed by: tune fastvlm setup
 
 if ! command -v jq &>/dev/null; then
@@ -662,32 +662,46 @@ if [ ! -f "$FILE_PATH" ]; then
   exit 0
 fi
 
+TUNE="$HOME/bin/tune"
 FASTVLM="$HOME/bin/fastvlm-cli"
-if [ ! -x "$FASTVLM" ]; then
-  exit 0
+INTENT="Describe this image comprehensively for a coding AI agent that cannot see it. Include: 1) Full OCR of all visible text, preserving layout and indentation 2) Visual context: what the image shows (terminal, browser, UI, diagram, etc), layout, colors 3) Actionable details: error messages, file paths, line numbers, URLs, button labels, status indicators. Be thorough and preserve exact text."
+
+# Try OpenRouter first (Gemini Flash Lite — cheap + high quality)
+if [ -x "$TUNE" ]; then
+  DESCRIPTION=$("$TUNE" image -i "$INTENT" --provider openrouter --model google/gemini-2.5-flash-lite --timeout 10 "$FILE_PATH" 2>/dev/null)
+  if [ -n "$DESCRIPTION" ]; then
+    jq -n --arg desc "$DESCRIPTION" '{
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": ("[tune:gemini-flash-lite] " + $desc)
+      }
+    }'
+    exit 0
+  fi
 fi
 
-DESCRIPTION=$("$FASTVLM" "$FILE_PATH" \
-  --prompt "Describe this image comprehensively for a coding AI agent that cannot see it. Include: 1) Full OCR of all visible text, preserving layout and indentation 2) Visual context: what the image shows (terminal, browser, UI, diagram, etc), layout, colors 3) Actionable details: error messages, file paths, line numbers, URLs, button labels, status indicators. Be thorough and preserve exact text." \
-  --model-path "$HOME/ml-fastvlm/app/FastVLM/model" \
-  --max-tokens 240 \
-  2>/dev/null)
-
-if [ -z "$DESCRIPTION" ]; then
-  # Failed — let Claude read the image normally
-  exit 0
+# Fallback: FastVLM (local, offline)
+if [ -x "$FASTVLM" ]; then
+  DESCRIPTION=$("$FASTVLM" "$FILE_PATH" \
+    --prompt "$INTENT" \
+    --model-path "$HOME/ml-fastvlm/app/FastVLM/model" \
+    --max-tokens 240 \
+    2>/dev/null)
+  if [ -n "$DESCRIPTION" ]; then
+    jq -n --arg desc "$DESCRIPTION" '{
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": ("[tune:fastvlm] " + $desc)
+      }
+    }'
+    exit 0
+  fi
 fi
 
-# Block the Read and return the description instead
-jq -n \
-  --arg desc "$DESCRIPTION" \
-  '{
-    "hookSpecificOutput": {
-      "hookEventName": "PreToolUse",
-      "permissionDecision": "block",
-      "permissionDecisionReason": ("[fastvlm] " + $desc)
-    }
-  }'
+# Both failed — let Claude read the image normally
+exit 0
 `
 
 func cmdFastVLM(args []string) error {
@@ -736,7 +750,7 @@ func cmdFastVLMStatus() error {
 		fmt.Printf("  %s Model: %s\n", ui.Success.Render("✓"), modelDir)
 	} else {
 		fmt.Printf("  %s Model not found at %s\n", ui.Warning.Render("✗"), modelDir)
-		fmt.Printf("    Download: cd ~/ml-fastvlm/app && ./get_pretrained_mlx_model.sh --model 0.5b --dest FastVLM/model\n")
+		fmt.Printf("    Download: cd ~/ml-fastvlm/app && ./get_pretrained_mlx_model.sh --model 1.5b --dest FastVLM/model\n")
 	}
 
 	// Check hook script
@@ -814,9 +828,9 @@ func cmdFastVLMSetup() error {
 	}
 	fmt.Printf("  %s ml-fastvlm repo: %s\n", ui.Success.Render("✓"), repoDir)
 
-	// Step 3: Download 0.5B model
+	// Step 3: Download 1.5B model
 	if _, err := os.Stat(filepath.Join(modelDir, "config.json")); err != nil {
-		fmt.Printf("  Downloading 0.5B model (~1GB)...\n")
+		fmt.Printf("  Downloading 1.5B model (~2GB)...\n")
 		if err := downloadModel(repoDir, modelDir); err != nil {
 			return fmt.Errorf("model download failed: %w", err)
 		}
@@ -942,7 +956,7 @@ func writeSwiftSources(projectDir string) error {
 }
 
 func downloadModel(_, modelDir string) error {
-	modelURL := "https://ml-site.cdn-apple.com/datasets/fastvlm/llava-fastvithd_0.5b_stage3_llm.fp16.zip"
+	modelURL := "https://ml-site.cdn-apple.com/datasets/fastvlm/llava-fastvithd_1.5b_stage3_llm.int8.zip"
 
 	if err := os.MkdirAll(modelDir, 0755); err != nil {
 		return err
@@ -1390,30 +1404,14 @@ func cmdFilter(args []string) error {
 	var result *filter.Result
 	var filterErr error
 
-	if exitCode != 0 {
-		result, filterErr = filter.FilterStream(ctx, cfg, os.Stdout, rawOutput, exitCode, intent)
-		if filterErr == nil && !strings.HasSuffix(result.Filtered, "\n") {
-			fmt.Println()
-		}
-	} else {
-		result, filterErr = filter.Filter(ctx, cfg, rawOutput, exitCode, intent)
-		if filterErr == nil {
-			fmt.Print(result.Filtered)
-			if !strings.HasSuffix(result.Filtered, "\n") {
-				fmt.Println()
-			}
-		}
-	}
-
+	result, filterErr = filter.Filter(ctx, cfg, rawOutput, exitCode, intent)
 	if filterErr != nil {
-		fmt.Fprintf(os.Stderr, "<🎼> filter error: %v\n", filterErr)
+		fmt.Fprintf(os.Stderr, "tune: filter error: %v\n", filterErr)
 		fmt.Print(rawOutput)
 		os.Exit(exitCode)
 	}
 
-	if teeFile != "" {
-		fmt.Fprintf(os.Stderr, "<🎼> %s\n", teeFile)
-	}
+	printTuneResult(result.Filtered, exitCode, teeFile)
 
 	s, _ := stats.Load()
 	s.Record(cmdStr, intent, result.RawLen, result.FilterLen, result.FilterTime)
@@ -1457,11 +1455,16 @@ func cmdFilterStreaming(cfg *config.Config, cmdArgs []string, cmdStr, cwd, inten
 		exitCodeCh <- exitCode
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Timeout)*time.Second)
-	defer cancel()
-
+	preview := progress.NewPreview(3)
 	cc := filter.DefaultChunkedConfig()
-	result, filterErr := filter.FilterChunked(ctx, cfg, cc, teeReader, os.Stdout, exitCodeCh)
+	cc.OnLine = func(line string) {
+		preview.AddLine(line)
+	}
+	cc.OnFlush = func() {
+		preview.Clear()
+	}
+	result, filterErr := filter.FilterChunked(context.Background(), cfg, cc, teeReader, io.Discard, exitCodeCh)
+	preview.Clear()
 
 	cmdElapsed := time.Since(cmdStart)
 
@@ -1479,11 +1482,16 @@ func cmdFilterStreaming(cfg *config.Config, cmdArgs []string, cmdStr, cwd, inten
 	}
 
 	if filterErr != nil {
-		fmt.Fprintf(os.Stderr, "<🎼> chunked filter error: %v\n", filterErr)
+		fmt.Fprintf(os.Stderr, "tune: filter error: %v\n", filterErr)
+	}
+
+	if result != nil && result.FilteredOutput != "" {
+		printTuneResult(result.FilteredOutput, exitCode, teeFile)
+		teeFile = "" // already printed
 	}
 
 	if teeFile != "" {
-		fmt.Fprintf(os.Stderr, "<🎼> %s\n", teeFile)
+		printTeeLine(teeFile)
 	}
 
 	if result != nil {
@@ -1499,6 +1507,35 @@ func cmdFilterStreaming(cfg *config.Config, cmdArgs []string, cmdStr, cwd, inten
 // ---------------------------------------------------------------------------
 // Tee file — write full raw output for later inspection
 // ---------------------------------------------------------------------------
+
+// printTuneResult formats and prints the filtered output with ✔︎/✖︎ prefix and tee file reference.
+func printTuneResult(filtered string, exitCode int, teeFile string) {
+	filtered = strings.TrimSpace(filtered)
+	if filtered == "" {
+		return
+	}
+
+	symbol := "✔︎"
+	if exitCode != 0 {
+		symbol = "✖︎"
+	}
+
+	// First line gets the symbol prefix
+	lines := strings.Split(filtered, "\n")
+	fmt.Fprintf(os.Stderr, " ┗ %s %s\n", symbol, lines[0])
+	for _, line := range lines[1:] {
+		fmt.Fprintf(os.Stderr, "   %s\n", line)
+	}
+
+	if teeFile != "" {
+		fmt.Fprintf(os.Stderr, "     [complete output at `%s`]\n", teeFile)
+	}
+}
+
+// printTeeLine prints just the tee file reference (when result was already printed or on error fallback).
+func printTeeLine(teeFile string) {
+	fmt.Fprintf(os.Stderr, "     [complete output at `%s`]\n", teeFile)
+}
 
 func writeTeeFile(cmdStr, rawOutput string) string {
 	tuneDir := stats.TuneDir()

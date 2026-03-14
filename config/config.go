@@ -36,8 +36,8 @@ func (c *Config) SetEnabled(v bool) {
 func DefaultConfig() Config {
 	return Config{
 		Provider:           "openrouter",
-		Model:              "openai/gpt-oss-20b",
-		OpenRouterProvider: "groq",
+		Model:              "google/gemini-2.5-flash-lite",
+		OpenRouterProvider: "",
 		APIKeys:            map[string]string{},
 		MaxInput:           16000,
 		Stream:             true,
@@ -173,7 +173,7 @@ func EnvVarForProvider(provider string) string {
 func DefaultModelForProvider(provider string) string {
 	switch provider {
 	case "openrouter":
-		return "openai/gpt-oss-20b"
+		return "google/gemini-2.5-flash-lite"
 	case "anthropic":
 		return "claude-haiku-4-5-20251001"
 	case "gemini":

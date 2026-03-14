@@ -93,14 +93,64 @@ func parseAnthropicDelta(data []byte) string {
 	return ""
 }
 
+// inactivityReader wraps a reader with a per-read timeout. If no data is read
+// within the timeout, the read returns an error. The timer resets on every
+// successful read — so an actively streaming response will never time out.
+type inactivityReader struct {
+	r       io.Reader
+	timeout time.Duration
+	timer   *time.Timer
+	done    chan struct{}
+}
+
+func newInactivityReader(r io.Reader, timeout time.Duration) *inactivityReader {
+	return &inactivityReader{
+		r:       r,
+		timeout: timeout,
+		timer:   time.NewTimer(timeout),
+		done:    make(chan struct{}),
+	}
+}
+
+func (ir *inactivityReader) Read(p []byte) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := ir.r.Read(p)
+		ch <- result{n, err}
+	}()
+
+	select {
+	case res := <-ch:
+		ir.timer.Reset(ir.timeout)
+		return res.n, res.err
+	case <-ir.timer.C:
+		return 0, fmt.Errorf("inactivity timeout: no data received for %s", ir.timeout)
+	case <-ir.done:
+		return 0, fmt.Errorf("reader closed")
+	}
+}
+
+func (ir *inactivityReader) Close() {
+	ir.timer.Stop()
+	close(ir.done)
+}
+
 // doSSEStream makes a streaming request and writes tokens to w as they arrive.
-// Returns the full concatenated response.
+// Returns the full concatenated response. Uses an inactivity timeout — the
+// stream only times out if no data arrives within the context's deadline duration
+// (or 10s if no deadline is set). Active streaming never times out.
 func doSSEStream(ctx context.Context, url, authValue, authScheme string, body map[string]any, w io.Writer, parse deltaParser) (string, error) {
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
 		return "", err
 	}
 
+	// Use a background context for the HTTP request — we handle timeouts
+	// via inactivity detection on the response body, not a hard deadline.
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyJSON))
 	if err != nil {
 		return "", err
@@ -126,8 +176,19 @@ func doSSEStream(ctx context.Context, url, authValue, authScheme string, body ma
 		return "", fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	// Determine inactivity timeout from context deadline, fallback to 10s
+	inactTimeout := 10 * time.Second
+	if dl, ok := ctx.Deadline(); ok {
+		inactTimeout = time.Until(dl)
+		if inactTimeout < 5*time.Second {
+			inactTimeout = 5 * time.Second
+		}
+	}
+	ir := newInactivityReader(resp.Body, inactTimeout)
+	defer ir.Close()
+
 	var full strings.Builder
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := bufio.NewScanner(ir)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -171,8 +232,11 @@ func doOllamaStream(ctx context.Context, body map[string]any, w io.Writer) (stri
 		return "", fmt.Errorf("Ollama error %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	ollamaIR := newInactivityReader(resp.Body, 10*time.Second)
+	defer ollamaIR.Close()
+
 	var full strings.Builder
-	decoder := json.NewDecoder(resp.Body)
+	decoder := json.NewDecoder(ollamaIR)
 	for decoder.More() {
 		var chunk struct {
 			Message struct {

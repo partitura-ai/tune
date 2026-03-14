@@ -16,7 +16,7 @@ Agent calls Run("go test -v ./...")
   → runs `command go test -v ./...` (bypasses function, calls real binary)
   → captures stdout+stderr + exit code
   → writes full raw output to ~/.tune/tee/<timestamp>_<cmd>.log
-  → sends output to LLM (gpt-oss-20b via Groq on OpenRouter, ~600ms)
+  → sends output to LLM (gemini-2.5-flash-lite on OpenRouter)
   → LLM returns only essential info
   → prints filtered output + [full output: /path/to/tee.log] reference
   → exits with original command's exit code
@@ -25,7 +25,7 @@ Agent calls Run("go test -v ./...")
 ### Key Design Decisions
 
 - **Go binary** — single binary, no dependencies, fast startup, embeds into Partitura
-- **OpenRouter + Groq provider** — gpt-oss-20b is free on OpenRouter, Groq inference is ~600ms
+- **OpenRouter + Gemini 2.5 Flash Lite** — default model, good context window and quality
 - **Exit code preservation** — tune always exits with the original command's exit code, regardless of filter success/failure
 - **Tee files** — full raw output always written to `~/.tune/tee/` so the agent can inspect it if the filtered output isn't enough. Last 50 files kept, auto-cleaned.
 - **Graceful fallback** — if filter fails (network, timeout, API error), prints raw output with original exit code
